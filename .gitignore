@@ -1,0 +1,24 @@
+# Rust and native build output
+/target/
+
+# Local media used for manual testing
+/sample*.mp4
+/sample*.mkv
+/sample*.webm
+
+# Incomplete output files
+*.partial.mp4
+*.partial.mkv
+*.partial.webm
+
+# Runtime diagnostics
+*.log
+core
+core.*
+
+# Editor and operating-system state
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
