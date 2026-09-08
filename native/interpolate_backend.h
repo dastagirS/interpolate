@@ -55,7 +55,9 @@ INTERPOLATE_BACKEND_EXPORT int32_t interpolate_backend_create(
 INTERPOLATE_BACKEND_EXPORT int32_t interpolate_backend_process_rgb24(
     interpolate_backend *backend,
     const uint8_t *frame_before,
+    size_t frame_before_size,
     const uint8_t *frame_after,
+    size_t frame_after_size,
     uint32_t width,
     uint32_t height,
     size_t row_stride,

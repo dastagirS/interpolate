@@ -26,7 +26,7 @@ cd "$REPOSITORY_ROOT"
 
 test -s Cargo.toml
 test -s Cargo.lock
-cargo fmt --all -- --check
+run_cargo fmt --all -- --check
 "$REPOSITORY_ROOT/scripts/verify-repository.sh"
 # Constant assertions are intentional executable documentation of safety limits.
 run_cargo clippy --locked --all-targets -- -D warnings -A clippy::assertions-on-constants

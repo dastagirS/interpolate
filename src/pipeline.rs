@@ -1,16 +1,28 @@
-use crate::backend::Backend;
+mod scheduler;
+
+pub use crate::cadence::{CadenceDiagnostics, ContentPreset};
+use crate::{
+    backend::Backend,
+    cadence::{
+        FrameDifference, is_confident_duplicate, is_smoothable_cadence_run,
+        measure_frame_difference_rgb24,
+    },
+    logging::JobLog,
+};
+use scheduler::OutputScheduler;
 use serde::Deserialize;
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::SyncSender,
     },
-    time::{Duration, Instant},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 const RGB_CHANNEL_COUNT: usize = 3;
@@ -20,34 +32,14 @@ const OUTPUT_FRAME_COUNT_MAX: u64 = 100_000_000;
 const TARGET_FPS_MAX: u32 = 480;
 const FFMPEG_THREAD_COUNT: &str = "2";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-const FRAME_SAMPLE_STEP: usize = 4;
+const PROBE_DIAGNOSTIC_SIZE_BYTES_MAX: usize = 64 * 1024;
+const PROBE_DIAGNOSTIC_LINE_COUNT_MAX: usize = 200;
+const PROBE_OUTPUT_SIZE_BYTES_MAX: usize = 1024 * 1024;
+const PROCESS_OUTPUT_READ_SIZE_BYTES: usize = 4096;
+const PROCESS_OUTPUT_READ_COUNT_MAX: usize = 1_048_576;
 const SCENE_THRESHOLD_DEFAULT: f64 = 0.15;
-const DUPLICATE_MEAN_DIFFERENCE_MAX: f64 = 0.006;
-const DUPLICATE_CHANGED_PIXEL_RATIO_MAX: f64 = 0.005;
-const DUPLICATE_TILE_DIFFERENCE_MAX: f64 = 0.01;
-const DUPLICATE_PIXEL_DIFFERENCE_MIN: u32 = 4 * 256;
-const DIFFERENCE_TILE_COLUMN_COUNT: usize = 8;
-const DIFFERENCE_TILE_ROW_COUNT: usize = 8;
-const DIFFERENCE_TILE_COUNT: usize = DIFFERENCE_TILE_COLUMN_COUNT * DIFFERENCE_TILE_ROW_COUNT;
-const CADENCE_RUN_FRAME_COUNT_MIN: u64 = 2;
-const CADENCE_RUN_FRAME_COUNT_MAX: u64 = 3;
 const MODEL_DIRECTORY_ENVIRONMENT: &str = "INTERPOLATE_MODEL_DIRECTORY";
 const MODEL_DIRECTORY_RELATIVE: &str = "share/interpolate/models/rife-v4.25";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContentPreset {
-    Anime,
-    Movie,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CadenceDiagnostics {
-    pub duplicate_frame_count: u64,
-    pub cadence_run_count: u64,
-    pub long_hold_count: u64,
-    pub scene_cut_count: u64,
-    pub inference_bypass_count: u64,
-}
 
 #[derive(Clone)]
 pub struct JobConfiguration {
@@ -146,29 +138,38 @@ pub fn probe_video(input_path: &Path) -> Result<VideoMetadata, String> {
         "input path must not be empty"
     );
     assert!(FRAME_DIMENSION_MAX > 0, "dimension limit must be positive");
+    probe_video_logged(input_path, None)
+}
+
+fn probe_video_logged(input_path: &Path, log: Option<&JobLog>) -> Result<VideoMetadata, String> {
+    assert!(
+        !input_path.as_os_str().is_empty(),
+        "input path must not be empty"
+    );
+    assert!(FRAME_DIMENSION_MAX > 0, "dimension limit must be positive");
     if !input_path.is_file() {
         return Err("input video does not exist or is not a regular file".to_owned());
     }
 
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,avg_frame_rate,pix_fmt,duration:format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(input_path)
-        .output()
-        .map_err(|error| format!("failed to start ffprobe: {error}"))?;
-    if !output.status.success() {
-        return Err("ffprobe could not inspect the selected video".to_owned());
+    let output = run_ffprobe(input_path)?;
+    if let Some(log) = log
+        && !output.stderr.is_empty()
+    {
+        let diagnostic_size = output.stderr.len().min(PROBE_DIAGNOSTIC_SIZE_BYTES_MAX);
+        let diagnostic = String::from_utf8_lossy(&output.stderr[..diagnostic_size]);
+        for line in diagnostic.lines().take(PROBE_DIAGNOSTIC_LINE_COUNT_MAX) {
+            let _ = log.write("ffprobe", line);
+        }
     }
-    const PROBE_OUTPUT_SIZE_MAX: usize = 1024 * 1024;
-    if output.stdout.len() > PROBE_OUTPUT_SIZE_MAX {
+    if !output.status.success() {
+        return Err(if output.stderr_exceeded {
+            "ffprobe could not inspect the selected video; diagnostics exceeded the capture limit"
+                .to_owned()
+        } else {
+            "ffprobe could not inspect the selected video".to_owned()
+        });
+    }
+    if output.stdout_exceeded {
         return Err("ffprobe returned unexpectedly large metadata".to_owned());
     }
     let probe: ProbeOutput = serde_json::from_slice(&output.stdout)
@@ -235,20 +236,181 @@ pub fn probe_video(input_path: &Path) -> Result<VideoMetadata, String> {
     Ok(metadata)
 }
 
+struct ProbeProcessOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stdout_exceeded: bool,
+    stderr: Vec<u8>,
+    stderr_exceeded: bool,
+}
+
+fn run_ffprobe(input_path: &Path) -> Result<ProbeProcessOutput, String> {
+    assert!(
+        !input_path.as_os_str().is_empty(),
+        "ffprobe input must not be empty"
+    );
+    assert!(
+        PROBE_OUTPUT_SIZE_BYTES_MAX > 0,
+        "probe output limit must be positive"
+    );
+    let mut child = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,pix_fmt,duration:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(input_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start ffprobe: {error}"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let cleanup_error = terminate_child(&mut child).err();
+            return Err(match cleanup_error {
+                Some(error) => {
+                    format!("ffprobe metadata pipe is unavailable; cleanup failed: {error}")
+                }
+                None => "ffprobe metadata pipe is unavailable".to_owned(),
+            });
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let cleanup_error = terminate_child(&mut child).err();
+            return Err(match cleanup_error {
+                Some(error) => {
+                    format!("ffprobe diagnostics pipe is unavailable; cleanup failed: {error}")
+                }
+                None => "ffprobe diagnostics pipe is unavailable".to_owned(),
+            });
+        }
+    };
+    let stderr_worker = match thread::Builder::new()
+        .name("ffprobe-log-reader".to_owned())
+        .spawn(move || drain_output_bounded(stderr, PROBE_DIAGNOSTIC_SIZE_BYTES_MAX))
+    {
+        Ok(stderr_worker) => stderr_worker,
+        Err(error) => {
+            drop(stdout);
+            let cleanup_error = terminate_child(&mut child).err();
+            return Err(match cleanup_error {
+                Some(cleanup_error) => format!(
+                    "failed to start ffprobe diagnostics reader: {error}; cleanup failed: {cleanup_error}"
+                ),
+                None => format!("failed to start ffprobe diagnostics reader: {error}"),
+            });
+        }
+    };
+    let stdout_result = drain_output_bounded(stdout, PROBE_OUTPUT_SIZE_BYTES_MAX);
+    let status_result = child
+        .wait()
+        .map_err(|error| format!("failed to wait for ffprobe: {error}"));
+    let stderr_result = stderr_worker
+        .join()
+        .map_err(|_| "ffprobe diagnostics reader panicked".to_owned())?;
+    let (stdout, stdout_exceeded) = stdout_result?;
+    let (stderr, stderr_exceeded) = stderr_result?;
+    let status = status_result?;
+    assert!(
+        stdout.len() <= PROBE_OUTPUT_SIZE_BYTES_MAX,
+        "probe output must remain bounded"
+    );
+    assert!(
+        stderr.len() <= PROBE_DIAGNOSTIC_SIZE_BYTES_MAX,
+        "probe diagnostics must remain bounded"
+    );
+    Ok(ProbeProcessOutput {
+        status,
+        stdout,
+        stdout_exceeded,
+        stderr,
+        stderr_exceeded,
+    })
+}
+
+fn drain_output_bounded<R: Read>(
+    mut reader: R,
+    size_bytes_max: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    assert!(size_bytes_max > 0, "process output limit must be positive");
+    assert!(
+        PROCESS_OUTPUT_READ_SIZE_BYTES > 0,
+        "process read size must be positive"
+    );
+    let mut output = Vec::with_capacity(size_bytes_max.min(PROCESS_OUTPUT_READ_SIZE_BYTES));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; PROCESS_OUTPUT_READ_SIZE_BYTES];
+    for _ in 0..PROCESS_OUTPUT_READ_COUNT_MAX {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read process output: {error}"))?;
+        if count == 0 {
+            assert!(
+                output.len() <= size_bytes_max,
+                "captured output must remain bounded"
+            );
+            assert!(
+                !exceeded || output.len() == size_bytes_max,
+                "truncated output must fill its limit"
+            );
+            return Ok((output, exceeded));
+        }
+        let remaining_size = size_bytes_max.saturating_sub(output.len());
+        let copy_size = count.min(remaining_size);
+        output.extend_from_slice(&buffer[..copy_size]);
+        exceeded |= copy_size < count;
+    }
+    Err("process output exceeded the read-count safety limit".to_owned())
+}
+
 pub fn run_job(
     configuration: JobConfiguration,
     cancelled: Arc<AtomicBool>,
     updates: SyncSender<JobUpdate>,
 ) {
+    assert!(TARGET_FPS_MAX > 0, "target FPS limit must be positive");
     assert!(
-        configuration.target_fps_num > 0,
-        "target FPS numerator must be positive"
+        OUTPUT_FRAME_COUNT_MAX > 0,
+        "output frame limit must be positive"
     );
-    assert!(
-        configuration.target_fps_den > 0,
-        "target FPS denominator must be positive"
-    );
-    let result = run_job_inner(&configuration, &cancelled, &updates);
+    let result = match JobLog::create() {
+        Ok(log) => {
+            let _ = log.write(
+                "application",
+                &format!(
+                    "starting {:?} job: {} -> {}",
+                    configuration.content_preset,
+                    configuration.input_path.display(),
+                    configuration.output_path.display()
+                ),
+            );
+            match run_job_inner(&configuration, &cancelled, &updates, &log) {
+                Ok(cadence_diagnostics) => {
+                    let _ = log.write("application", "job completed successfully");
+                    Ok(cadence_diagnostics)
+                }
+                Err(error) => {
+                    let _ = log.write("application", &format!("job failed: {error}"));
+                    let summary = log.recent_summary();
+                    Err(format!(
+                        "{error}\nDiagnostics: {}\n{summary}",
+                        log.path().display()
+                    ))
+                }
+            }
+        }
+        Err(error) => Err(error),
+    };
     let terminal_update = match result {
         Ok(cadence_diagnostics) => JobUpdate::Completed {
             path: configuration.output_path.clone(),
@@ -258,13 +420,10 @@ pub fn run_job(
         Err(error) => JobUpdate::Failed(error),
     };
     let _ = updates.send(terminal_update);
+    assert!(TARGET_FPS_MAX > 0, "target FPS limit must remain valid");
     assert!(
-        configuration.target_fps_num <= TARGET_FPS_MAX,
-        "target FPS must remain bounded"
-    );
-    assert!(
-        !configuration.output_path.as_os_str().is_empty(),
-        "output path must remain valid"
+        FRAME_SIZE_BYTES_MAX > 0,
+        "frame size limit must remain valid"
     );
 }
 
@@ -358,18 +517,16 @@ fn run_job_inner(
     configuration: &JobConfiguration,
     cancelled: &AtomicBool,
     updates: &SyncSender<JobUpdate>,
+    log: &JobLog,
 ) -> Result<CadenceDiagnostics, String> {
+    assert!(TARGET_FPS_MAX > 0, "target FPS limit must be positive");
     assert!(
-        configuration.target_fps_num > 0,
-        "target FPS must be positive"
-    );
-    assert!(
-        !configuration.input_path.as_os_str().is_empty(),
-        "input path must be present"
+        OUTPUT_FRAME_COUNT_MAX > 0,
+        "output frame limit must be positive"
     );
     validate_configuration(configuration)?;
     send_update(updates, JobUpdate::Phase("Probing video"));
-    let metadata = probe_video(&configuration.input_path)?;
+    let metadata = probe_video_logged(&configuration.input_path, Some(log))?;
     validate_target_fps(configuration, &metadata)?;
     if cancelled.load(Ordering::Acquire) {
         return Err("job cancelled".to_owned());
@@ -390,12 +547,22 @@ fn run_job_inner(
     }
 
     send_update(updates, JobUpdate::Phase("Starting media pipeline"));
-    let mut decoder = spawn_decoder(configuration, &metadata)?;
-    let mut encoder = match spawn_encoder(configuration, &metadata, &partial_path) {
+    let mut decoder = spawn_decoder(configuration, &metadata, log)?;
+    let mut encoder = match spawn_encoder(configuration, &metadata, &partial_path, log) {
         Ok(encoder) => encoder,
         Err(error) => {
-            terminate_child(&mut decoder);
-            return Err(error);
+            let terminate_result = terminate_child(&mut decoder.child);
+            let log_result = finish_log_worker(&mut decoder);
+            let mut combined_error = error;
+            if let Err(terminate_error) = terminate_result {
+                combined_error.push_str(&format!("; decoder cleanup failed: {terminate_error}"));
+            }
+            if let Err(log_error) = log_result {
+                combined_error.push_str(&format!(
+                    "; decoder diagnostics failed during cleanup: {log_error}"
+                ));
+            }
+            return Err(combined_error);
         }
     };
 
@@ -405,37 +572,65 @@ fn run_job_inner(
         cancelled,
         updates,
         &mut backend,
-        &mut decoder,
-        &mut encoder,
+        &mut decoder.child,
+        &mut encoder.child,
     ) {
         Ok(cadence_diagnostics) => cadence_diagnostics,
         Err(error) => {
-            terminate_child(&mut decoder);
-            terminate_child(&mut encoder);
-            let _ = fs::remove_file(&partial_path);
-            return Err(error);
+            let decoder_terminate_result = terminate_child(&mut decoder.child);
+            let encoder_terminate_result = terminate_child(&mut encoder.child);
+            let decoder_log_result = finish_log_worker(&mut decoder);
+            let encoder_log_result = finish_log_worker(&mut encoder);
+            let was_cancelled = cancelled.load(Ordering::Acquire);
+            if was_cancelled {
+                let _ = fs::remove_file(&partial_path);
+            }
+            let mut combined_error = error;
+            if !was_cancelled && partial_path.exists() {
+                combined_error.push_str(&format!(
+                    "; recoverable partial output remains at {}",
+                    partial_path.display()
+                ));
+            }
+            if let Err(terminate_error) = decoder_terminate_result {
+                combined_error.push_str(&format!("; decoder cleanup failed: {terminate_error}"));
+            }
+            if let Err(terminate_error) = encoder_terminate_result {
+                combined_error.push_str(&format!("; encoder cleanup failed: {terminate_error}"));
+            }
+            if let Err(log_error) = decoder_log_result {
+                combined_error.push_str(&format!("; decoder diagnostics failed: {log_error}"));
+            }
+            if let Err(log_error) = encoder_log_result {
+                combined_error.push_str(&format!("; encoder diagnostics failed: {log_error}"));
+            }
+            return Err(combined_error);
         }
     };
 
     send_update(updates, JobUpdate::Phase("Finalizing output"));
-    let decoder_status = decoder
-        .wait()
-        .map_err(|error| format!("failed to wait for decoder: {error}"))?;
-    let encoder_status = encoder
-        .wait()
-        .map_err(|error| format!("failed to wait for encoder: {error}"))?;
+    let decoder_result = wait_media_child(&mut decoder, "decoder");
+    let encoder_result = wait_media_child(&mut encoder, "encoder");
+    let decoder_status = decoder_result?;
+    let encoder_status = encoder_result?;
     if !decoder_status.success() {
-        let _ = fs::remove_file(&partial_path);
-        return Err("FFmpeg decoder failed".to_owned());
+        return Err(format!(
+            "FFmpeg decoder failed; recoverable partial output, if any, remains at {}",
+            partial_path.display()
+        ));
     }
     if !encoder_status.success() {
-        let _ = fs::remove_file(&partial_path);
-        return Err(
-            "FFmpeg encoder failed; an input stream may not be compatible with MKV".to_owned(),
-        );
+        return Err(format!(
+            "FFmpeg encoder failed; an input stream may not be compatible with MKV. Recoverable partial output, if any, remains at {}",
+            partial_path.display()
+        ));
     }
-    fs::rename(&partial_path, &configuration.output_path)
-        .map_err(|error| format!("failed to publish completed output: {error}"))?;
+    fs::rename(&partial_path, &configuration.output_path).map_err(|error| {
+        format!(
+            "failed to publish completed output: {error}. Completed partial output remains at {}",
+            partial_path.display()
+        )
+    })?;
     assert!(
         configuration.output_path.is_file(),
         "completed output must exist"
@@ -512,13 +707,19 @@ fn validate_target_fps(
     Ok(())
 }
 
+struct MediaChild {
+    child: Child,
+    log_worker: Option<JoinHandle<Result<(), String>>>,
+}
+
 fn spawn_decoder(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
-) -> Result<Child, String> {
+    log: &JobLog,
+) -> Result<MediaChild, String> {
     assert!(metadata.width > 0, "decoder width must be positive");
     assert!(metadata.height > 0, "decoder height must be positive");
-    let child = Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
         .args([
             "-nostdin",
             "-v",
@@ -544,19 +745,46 @@ fn spawn_decoder(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to start FFmpeg decoder: {error}"))?;
+    let decoder_error = match child.stderr.take() {
+        Some(decoder_error) => decoder_error,
+        None => {
+            let cleanup_error = terminate_child(&mut child).err();
+            return Err(match cleanup_error {
+                Some(error) => {
+                    format!("decoder diagnostics pipe is unavailable; cleanup failed: {error}")
+                }
+                None => "decoder diagnostics pipe is unavailable".to_owned(),
+            });
+        }
+    };
+    let log_worker = match log.spawn_reader("decoder", decoder_error) {
+        Ok(log_worker) => log_worker,
+        Err(error) => {
+            return match terminate_child(&mut child) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => {
+                    Err(format!("{error}; decoder cleanup failed: {cleanup_error}"))
+                }
+            };
+        }
+    };
     assert!(child.stdout.is_some(), "decoder stdout must be piped");
     assert!(child.stdin.is_none(), "decoder stdin must be closed");
-    Ok(child)
+    Ok(MediaChild {
+        child,
+        log_worker: Some(log_worker),
+    })
 }
 
 fn spawn_encoder(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
     partial_path: &Path,
-) -> Result<Child, String> {
+    log: &JobLog,
+) -> Result<MediaChild, String> {
     assert!(metadata.width > 0, "encoder width must be positive");
     assert!(
         configuration.target_fps_den > 0,
@@ -567,7 +795,7 @@ fn spawn_encoder(
         "{}/{}",
         configuration.target_fps_num, configuration.target_fps_den
     );
-    let child = Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
         .args([
             "-nostdin",
             "-v",
@@ -615,253 +843,38 @@ fn spawn_encoder(
         .arg(partial_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to start FFmpeg encoder: {error}"))?;
+    let encoder_error = match child.stderr.take() {
+        Some(encoder_error) => encoder_error,
+        None => {
+            let cleanup_error = terminate_child(&mut child).err();
+            return Err(match cleanup_error {
+                Some(error) => {
+                    format!("encoder diagnostics pipe is unavailable; cleanup failed: {error}")
+                }
+                None => "encoder diagnostics pipe is unavailable".to_owned(),
+            });
+        }
+    };
+    let log_worker = match log.spawn_reader("encoder", encoder_error) {
+        Ok(log_worker) => log_worker,
+        Err(error) => {
+            return match terminate_child(&mut child) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => {
+                    Err(format!("{error}; encoder cleanup failed: {cleanup_error}"))
+                }
+            };
+        }
+    };
     assert!(child.stdin.is_some(), "encoder stdin must be piped");
     assert!(child.stdout.is_none(), "encoder stdout must be closed");
-    Ok(child)
-}
-
-struct OutputScheduler<'a> {
-    factor_num: u128,
-    factor_den: u128,
-    frame_count_estimate: u64,
-    output_index: u64,
-    started_at: Instant,
-    progress_at: Instant,
-    metadata: &'a VideoMetadata,
-    cancelled: &'a AtomicBool,
-    updates: &'a SyncSender<JobUpdate>,
-    backend: &'a mut Backend,
-    encoder_input: &'a mut ChildStdin,
-    frame_output: Vec<u8>,
-    cadence_diagnostics: CadenceDiagnostics,
-}
-
-impl<'a> OutputScheduler<'a> {
-    fn new(
-        configuration: &JobConfiguration,
-        metadata: &'a VideoMetadata,
-        cancelled: &'a AtomicBool,
-        updates: &'a SyncSender<JobUpdate>,
-        backend: &'a mut Backend,
-        encoder_input: &'a mut ChildStdin,
-        frame_size: usize,
-    ) -> Self {
-        assert!(
-            configuration.target_fps_num > 0,
-            "target FPS must be positive"
-        );
-        assert!(metadata.source_fps_num > 0, "source FPS must be positive");
-        let factor_num =
-            u128::from(configuration.target_fps_num) * u128::from(metadata.source_fps_den);
-        let factor_den =
-            u128::from(configuration.target_fps_den) * u128::from(metadata.source_fps_num);
-        let frame_count_estimate = ((metadata.duration_seconds
-            * f64::from(configuration.target_fps_num)
-            / f64::from(configuration.target_fps_den))
-        .ceil() as u64)
-            .clamp(1, OUTPUT_FRAME_COUNT_MAX);
-        let started_at = Instant::now();
-        let scheduler = Self {
-            factor_num,
-            factor_den,
-            frame_count_estimate,
-            output_index: 0,
-            started_at,
-            progress_at: started_at,
-            metadata,
-            cancelled,
-            updates,
-            backend,
-            encoder_input,
-            frame_output: vec![0_u8; frame_size],
-            cadence_diagnostics: CadenceDiagnostics::default(),
-        };
-        assert!(
-            scheduler.factor_num > scheduler.factor_den,
-            "target FPS must exceed source FPS"
-        );
-        assert_eq!(
-            scheduler.frame_output.len(),
-            frame_size,
-            "output frame must have the requested size"
-        );
-        scheduler
-    }
-
-    fn write_span(
-        &mut self,
-        frame_before: &[u8],
-        frame_after: &[u8],
-        source_index_start: u64,
-        source_index_end: u64,
-        interpolate: bool,
-    ) -> Result<(), String> {
-        assert!(
-            source_index_end > source_index_start,
-            "source span must be positive"
-        );
-        assert_eq!(
-            frame_before.len(),
-            self.frame_output.len(),
-            "source frame size must match output"
-        );
-        assert_eq!(
-            frame_after.len(),
-            self.frame_output.len(),
-            "endpoint frame size must match output"
-        );
-
-        let position_scaled_start = u128::from(source_index_start)
-            .checked_mul(self.factor_num)
-            .ok_or_else(|| "source span start overflowed".to_owned())?;
-        let position_scaled_end = u128::from(source_index_end)
-            .checked_mul(self.factor_num)
-            .ok_or_else(|| "source span end overflowed".to_owned())?;
-        let duration_scaled = position_scaled_end - position_scaled_start;
-
-        while self.output_index < OUTPUT_FRAME_COUNT_MAX {
-            if self.cancelled.load(Ordering::Acquire) {
-                return Err("job cancelled".to_owned());
-            }
-            let position_scaled = u128::from(self.output_index)
-                .checked_mul(self.factor_den)
-                .ok_or_else(|| "output frame position overflowed".to_owned())?;
-            if position_scaled >= position_scaled_end {
-                break;
-            }
-            if position_scaled < position_scaled_start {
-                return Err("output scheduler encountered an overlapping source span".to_owned());
-            }
-
-            let relative_scaled = position_scaled - position_scaled_start;
-            if interpolate && relative_scaled > 0 {
-                let timestep = (relative_scaled as f64 / duration_scaled as f64) as f32;
-                if !(0.0..1.0).contains(&timestep) {
-                    return Err("interpolation timestep escaped its source span".to_owned());
-                }
-                self.backend.interpolate_rgb24(
-                    frame_before,
-                    frame_after,
-                    self.metadata.width,
-                    self.metadata.height,
-                    timestep,
-                    &mut self.frame_output,
-                )?;
-                self.encoder_input
-                    .write_all(&self.frame_output)
-                    .map_err(|error| {
-                        format!("failed to send interpolated frame to encoder: {error}")
-                    })?;
-            } else {
-                self.encoder_input
-                    .write_all(frame_before)
-                    .map_err(|error| format!("failed to send source frame to encoder: {error}"))?;
-                if relative_scaled > 0 {
-                    self.cadence_diagnostics.inference_bypass_count = self
-                        .cadence_diagnostics
-                        .inference_bypass_count
-                        .saturating_add(1);
-                }
-            }
-            self.output_index = self
-                .output_index
-                .checked_add(1)
-                .ok_or_else(|| "output frame index overflowed".to_owned())?;
-            self.report_progress();
-        }
-        if self.output_index >= OUTPUT_FRAME_COUNT_MAX {
-            return Err(format!(
-                "output exceeds the {OUTPUT_FRAME_COUNT_MAX}-frame safety limit"
-            ));
-        }
-        assert!(
-            self.output_index < OUTPUT_FRAME_COUNT_MAX,
-            "output count must remain bounded"
-        );
-        assert!(
-            duration_scaled > 0,
-            "scaled source duration must be positive"
-        );
-        Ok(())
-    }
-
-    fn report_progress(&mut self) {
-        assert!(
-            self.frame_count_estimate > 0,
-            "estimated frame count must be positive"
-        );
-        assert!(
-            self.output_index < OUTPUT_FRAME_COUNT_MAX,
-            "reported frame count must be bounded"
-        );
-        let now = Instant::now();
-        if now.duration_since(self.progress_at) >= PROGRESS_INTERVAL {
-            let elapsed_seconds = now.duration_since(self.started_at).as_secs_f64().max(0.001);
-            let processing_fps = self.output_index as f64 / elapsed_seconds;
-            let progress = (self.output_index as f64 / self.frame_count_estimate as f64)
-                .clamp(0.0, 1.0) as f32;
-            send_update(
-                self.updates,
-                JobUpdate::Progress {
-                    frame_count: self.output_index,
-                    frame_count_estimate: self.frame_count_estimate,
-                    processing_fps,
-                    progress,
-                    cadence_diagnostics: self.cadence_diagnostics,
-                },
-            );
-            self.progress_at = now;
-        }
-        assert!(self.started_at <= now, "progress time must be monotonic");
-        assert!(
-            (0.0..=1.0).contains(
-                &(self.output_index as f64 / self.frame_count_estimate as f64).clamp(0.0, 1.0)
-            ),
-            "progress must remain bounded"
-        );
-    }
-
-    fn finish(&mut self) -> Result<(), String> {
-        assert!(
-            self.output_index > 0,
-            "processing must produce at least one frame"
-        );
-        assert!(
-            self.output_index < OUTPUT_FRAME_COUNT_MAX,
-            "output must stay below its safety limit"
-        );
-        self.encoder_input
-            .flush()
-            .map_err(|error| format!("failed to flush encoder input: {error}"))?;
-        send_update(
-            self.updates,
-            JobUpdate::Progress {
-                frame_count: self.output_index,
-                frame_count_estimate: self.output_index,
-                processing_fps: self.output_index as f64
-                    / self.started_at.elapsed().as_secs_f64().max(0.001),
-                progress: 1.0,
-                cadence_diagnostics: self.cadence_diagnostics,
-            },
-        );
-        assert!(self.output_index > 0, "finished output must contain frames");
-        assert_eq!(
-            self.frame_output.len(),
-            checked_frame_size(self.metadata.width, self.metadata.height)?,
-            "working frame size must remain valid"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct FrameDifference {
-    mean: f64,
-    changed_pixel_ratio: f64,
-    tile_mean_max: f64,
+    Ok(MediaChild {
+        child,
+        log_worker: Some(log_worker),
+    })
 }
 
 fn process_frames(
@@ -1105,128 +1118,6 @@ fn read_frame(reader: &mut ChildStdout, frame: &mut [u8]) -> Result<bool, String
     Ok(true)
 }
 
-fn measure_frame_difference_rgb24(
-    frame_before: &[u8],
-    frame_after: &[u8],
-    width: u32,
-    height: u32,
-) -> FrameDifference {
-    assert_eq!(
-        frame_before.len(),
-        frame_after.len(),
-        "difference frames must have equal size"
-    );
-    assert!(
-        width > 0 && height > 0,
-        "difference dimensions must be positive"
-    );
-    let width = width as usize;
-    let height = height as usize;
-    let row_stride = width * RGB_CHANNEL_COUNT;
-    let mut difference_sum = 0_u64;
-    let mut changed_pixel_count = 0_u64;
-    let mut sample_count = 0_u64;
-    let mut tile_difference_sums = [0_u64; DIFFERENCE_TILE_COUNT];
-    let mut tile_sample_counts = [0_u64; DIFFERENCE_TILE_COUNT];
-
-    for y in (0..height).step_by(FRAME_SAMPLE_STEP) {
-        for x in (0..width).step_by(FRAME_SAMPLE_STEP) {
-            let index = y * row_stride + x * RGB_CHANNEL_COUNT;
-            let before_luma = 54_u32 * u32::from(frame_before[index])
-                + 183_u32 * u32::from(frame_before[index + 1])
-                + 19_u32 * u32::from(frame_before[index + 2]);
-            let after_luma = 54_u32 * u32::from(frame_after[index])
-                + 183_u32 * u32::from(frame_after[index + 1])
-                + 19_u32 * u32::from(frame_after[index + 2]);
-            let difference = before_luma.abs_diff(after_luma);
-            difference_sum += u64::from(difference);
-            if difference >= DUPLICATE_PIXEL_DIFFERENCE_MIN {
-                changed_pixel_count += 1;
-            }
-            let tile_x =
-                (x * DIFFERENCE_TILE_COLUMN_COUNT / width).min(DIFFERENCE_TILE_COLUMN_COUNT - 1);
-            let tile_y =
-                (y * DIFFERENCE_TILE_ROW_COUNT / height).min(DIFFERENCE_TILE_ROW_COUNT - 1);
-            let tile_index = tile_y * DIFFERENCE_TILE_COLUMN_COUNT + tile_x;
-            tile_difference_sums[tile_index] += u64::from(difference);
-            tile_sample_counts[tile_index] += 1;
-            sample_count += 1;
-        }
-    }
-
-    let difference_max = 255_u64 * 256_u64;
-    let mean = difference_sum as f64 / (sample_count.max(1) * difference_max) as f64;
-    let changed_pixel_ratio = changed_pixel_count as f64 / sample_count.max(1) as f64;
-    let mut tile_mean_max = 0.0_f64;
-    for tile_index in 0..DIFFERENCE_TILE_COUNT {
-        let tile_sample_count = tile_sample_counts[tile_index];
-        if tile_sample_count > 0 {
-            let tile_mean = tile_difference_sums[tile_index] as f64
-                / (tile_sample_count * difference_max) as f64;
-            tile_mean_max = tile_mean_max.max(tile_mean);
-        }
-    }
-    let difference = FrameDifference {
-        mean,
-        changed_pixel_ratio,
-        tile_mean_max,
-    };
-    assert!(
-        sample_count > 0,
-        "difference detector must sample at least one pixel"
-    );
-    assert!(
-        (0.0..=1.0).contains(&difference.mean),
-        "mean difference must be normalized"
-    );
-    difference
-}
-
-fn is_smoothable_cadence_run(cadence_run_frame_count: u64) -> bool {
-    assert!(
-        cadence_run_frame_count > 0,
-        "cadence run must contain at least one frame"
-    );
-    assert!(
-        cadence_run_frame_count < OUTPUT_FRAME_COUNT_MAX,
-        "cadence run must remain bounded"
-    );
-    let smoothable = (CADENCE_RUN_FRAME_COUNT_MIN..=CADENCE_RUN_FRAME_COUNT_MAX)
-        .contains(&cadence_run_frame_count);
-    assert!(
-        !smoothable || cadence_run_frame_count >= CADENCE_RUN_FRAME_COUNT_MIN,
-        "smoothable cadence must contain a held drawing"
-    );
-    assert!(
-        !smoothable || cadence_run_frame_count <= CADENCE_RUN_FRAME_COUNT_MAX,
-        "smoothable cadence must satisfy its upper limit"
-    );
-    smoothable
-}
-
-fn is_confident_duplicate(difference: FrameDifference) -> bool {
-    assert!(
-        (0.0..=1.0).contains(&difference.mean),
-        "mean difference must be normalized"
-    );
-    assert!(
-        (0.0..=1.0).contains(&difference.changed_pixel_ratio),
-        "changed-pixel ratio must be normalized"
-    );
-    let duplicate = difference.mean <= DUPLICATE_MEAN_DIFFERENCE_MAX
-        && difference.changed_pixel_ratio <= DUPLICATE_CHANGED_PIXEL_RATIO_MAX
-        && difference.tile_mean_max <= DUPLICATE_TILE_DIFFERENCE_MAX;
-    assert!(
-        !duplicate || difference.tile_mean_max <= DUPLICATE_TILE_DIFFERENCE_MAX,
-        "duplicate tiles must satisfy their limit"
-    );
-    assert!(
-        !duplicate || difference.mean <= DUPLICATE_MEAN_DIFFERENCE_MAX,
-        "duplicate mean must satisfy its limit"
-    );
-    duplicate
-}
-
 fn parse_rational(text: &str) -> Result<(u64, u64), String> {
     assert!(!text.is_empty(), "rational text must not be empty");
     assert!(text.len() <= 64, "rational text must remain bounded");
@@ -1332,7 +1223,68 @@ fn send_update(updates: &SyncSender<JobUpdate>, update: JobUpdate) {
     );
 }
 
-fn terminate_child(child: &mut Child) {
+fn wait_media_child(media_child: &mut MediaChild, description: &str) -> Result<ExitStatus, String> {
+    assert!(
+        !description.is_empty(),
+        "media child description must not be empty"
+    );
+    assert!(
+        description.len() <= 32,
+        "media child description must remain bounded"
+    );
+    let wait_result = media_child
+        .child
+        .wait()
+        .map_err(|error| format!("failed to wait for {description}: {error}"));
+    let terminate_result = if wait_result.is_err() {
+        terminate_child(&mut media_child.child)
+    } else {
+        Ok(())
+    };
+    let log_result = finish_log_worker(media_child);
+    let status = wait_result?;
+    terminate_result?;
+    log_result?;
+    assert!(
+        media_child.log_worker.is_none(),
+        "waited media log must be released"
+    );
+    assert!(
+        !description.is_empty(),
+        "media child description must remain valid"
+    );
+    Ok(status)
+}
+
+fn finish_log_worker(media_child: &mut MediaChild) -> Result<(), String> {
+    assert!(
+        FFMPEG_THREAD_COUNT == "2",
+        "FFmpeg thread limit must remain explicit"
+    );
+    assert!(
+        FRAME_SIZE_BYTES_MAX > 0,
+        "memory limit must remain configured"
+    );
+    let log_worker = media_child
+        .log_worker
+        .take()
+        .ok_or_else(|| "media log worker is unavailable".to_owned())?;
+    let result = log_worker
+        .join()
+        .map_err(|_| "media log worker panicked".to_owned())?;
+    result?;
+    assert!(
+        media_child.log_worker.is_none(),
+        "finished log worker must be released"
+    );
+    assert!(
+        OUTPUT_FRAME_COUNT_MAX > 0,
+        "frame count limit must remain configured"
+    );
+    Ok(())
+}
+
+fn terminate_child(child: &mut Child) -> Result<(), String> {
     assert!(
         FFMPEG_THREAD_COUNT == "2",
         "FFmpeg thread limit must remain explicit"
@@ -1344,22 +1296,37 @@ fn terminate_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            child
+                .kill()
+                .map_err(|error| format!("failed to terminate media process: {error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("failed to reap terminated media process: {error}"))?;
         }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+        Err(error) => {
+            let try_wait_error = error;
+            child.kill().map_err(|kill_error| {
+                format!(
+                    "failed to inspect media process ({try_wait_error}) and terminate it: {kill_error}"
+                )
+            })?;
+            child.wait().map_err(|wait_error| {
+                format!("failed to reap media process after inspection failed: {wait_error}")
+            })?;
         }
     }
-    assert!(
-        child.try_wait().ok().flatten().is_some(),
-        "terminated child must be reaped"
-    );
+    let final_status = child
+        .try_wait()
+        .map_err(|error| format!("failed to confirm media process termination: {error}"))?;
+    if final_status.is_none() {
+        return Err("media process remained active after termination".to_owned());
+    }
+    assert!(final_status.is_some(), "terminated child must be reaped");
     assert!(
         OUTPUT_FRAME_COUNT_MAX > 0,
         "frame count limit must remain configured"
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1377,39 +1344,16 @@ mod tests {
     }
 
     #[test]
-    fn scene_difference_detects_a_hard_cut() {
-        let black = vec![0_u8; 12 * 12 * RGB_CHANNEL_COUNT];
-        let white = vec![255_u8; 12 * 12 * RGB_CHANNEL_COUNT];
-        let difference = measure_frame_difference_rgb24(&black, &white, 12, 12);
-        assert!(difference.mean > 0.99);
-        assert!(difference.mean <= 1.0);
-    }
+    fn bounded_process_output_is_drained_and_truncated() {
+        let (captured, exceeded) =
+            drain_output_bounded(&b"0123456789"[..], 4).expect("bounded output should be readable");
+        assert_eq!(captured, b"0123");
+        assert!(exceeded, "oversized process output must be reported");
 
-    #[test]
-    fn confident_duplicate_accepts_uniform_decode_noise() {
-        let frame_before = vec![64_u8; 64 * 64 * RGB_CHANNEL_COUNT];
-        let frame_after = vec![65_u8; 64 * 64 * RGB_CHANNEL_COUNT];
-        let difference = measure_frame_difference_rgb24(&frame_before, &frame_after, 64, 64);
-        assert!(is_confident_duplicate(difference));
-        assert!(difference.mean > 0.0);
-    }
-
-    #[test]
-    fn confident_duplicate_rejects_localized_motion() {
-        let frame_before = vec![0_u8; 64 * 64 * RGB_CHANNEL_COUNT];
-        let mut frame_after = frame_before.clone();
-        frame_after[..RGB_CHANNEL_COUNT].fill(255);
-        let difference = measure_frame_difference_rgb24(&frame_before, &frame_after, 64, 64);
-        assert!(!is_confident_duplicate(difference));
-        assert!(difference.tile_mean_max > DUPLICATE_TILE_DIFFERENCE_MAX);
-    }
-
-    #[test]
-    fn cadence_smoothing_accepts_only_two_or_three_frame_runs() {
-        assert!(!is_smoothable_cadence_run(1));
-        assert!(is_smoothable_cadence_run(2));
-        assert!(is_smoothable_cadence_run(3));
-        assert!(!is_smoothable_cadence_run(4));
+        let (captured, exceeded) =
+            drain_output_bounded(&b"ok"[..], 4).expect("small output should be readable");
+        assert_eq!(captured, b"ok");
+        assert!(!exceeded, "small process output must not be truncated");
     }
 
     #[test]
@@ -1425,28 +1369,6 @@ mod tests {
         assert!(parse_rational("24/0").is_err());
         assert!(parse_rational("nope/1").is_err());
         assert!(parse_rational("1/nope").is_err());
-    }
-
-    #[test]
-    fn duplicate_confidence_requires_every_metric() {
-        let accepted = FrameDifference {
-            mean: DUPLICATE_MEAN_DIFFERENCE_MAX,
-            changed_pixel_ratio: DUPLICATE_CHANGED_PIXEL_RATIO_MAX,
-            tile_mean_max: DUPLICATE_TILE_DIFFERENCE_MAX,
-        };
-        assert!(is_confident_duplicate(accepted));
-        assert!(!is_confident_duplicate(FrameDifference {
-            mean: DUPLICATE_MEAN_DIFFERENCE_MAX + f64::EPSILON,
-            ..accepted
-        }));
-        assert!(!is_confident_duplicate(FrameDifference {
-            changed_pixel_ratio: DUPLICATE_CHANGED_PIXEL_RATIO_MAX + f64::EPSILON,
-            ..accepted
-        }));
-        assert!(!is_confident_duplicate(FrameDifference {
-            tile_mean_max: DUPLICATE_TILE_DIFFERENCE_MAX + f64::EPSILON,
-            ..accepted
-        }));
     }
 
     #[test]
@@ -1521,10 +1443,24 @@ mod tests {
             OUTPUT_FRAME_COUNT_MAX > 8,
             "test must remain below output safety limit"
         );
-        let input_path = PathBuf::from(format!("/tmp/interpolate-input-{process_id}.mp4"));
+        let input_path = PathBuf::from(format!("/tmp/interpolate-input-{process_id}.mkv"));
         let output_path = PathBuf::from(format!("/tmp/interpolate-output-{process_id}.mkv"));
+        let subtitle_path = PathBuf::from(format!("/tmp/interpolate-subtitle-{process_id}.srt"));
         let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&output_path);
+        let _ = fs::remove_file(&subtitle_path);
+        fs::write(
+            &subtitle_path,
+            "1\n00:00:00,000 --> 00:00:00,900\nInterpolation test\n",
+        )
+        .expect("test subtitle should be created");
+        assert!(subtitle_path.is_file(), "test subtitle must exist");
+        assert!(
+            fs::metadata(&subtitle_path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "test subtitle must not be empty"
+        );
         let generated = Command::new("ffmpeg")
             .args([
                 "-nostdin",
@@ -1535,6 +1471,26 @@ mod tests {
                 "lavfi",
                 "-i",
                 "color=c=black:size=64x64:rate=4:duration=1,drawbox=color=0x202020:t=fill:enable=gte(n\\,3)",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000:duration=1",
+                "-f",
+                "srt",
+                "-i",
+            ])
+            .arg(&subtitle_path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:s:0",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:v",
@@ -1589,6 +1545,67 @@ mod tests {
         assert!(
             !cancelled_output_path.exists(),
             "cancelled output must not be published"
+        );
+
+        let active_cancelled_output_path = PathBuf::from(format!(
+            "/tmp/interpolate-active-cancelled-{process_id}.mkv"
+        ));
+        let _ = fs::remove_file(&active_cancelled_output_path);
+        let mut active_cancelled_configuration = configuration.clone();
+        active_cancelled_configuration.output_path = active_cancelled_output_path.clone();
+        let active_cancelled = Arc::new(AtomicBool::new(false));
+        let active_worker_cancelled = Arc::clone(&active_cancelled);
+        let (active_sender, active_receiver) = std::sync::mpsc::sync_channel(4);
+        let active_worker = std::thread::spawn(move || {
+            run_job(
+                active_cancelled_configuration,
+                active_worker_cancelled,
+                active_sender,
+            )
+        });
+        let mut active_phase_seen = false;
+        let mut active_cancellation_reported = false;
+        const ACTIVE_CANCELLATION_UPDATE_COUNT_MAX: usize = 30;
+        for _ in 0..ACTIVE_CANCELLATION_UPDATE_COUNT_MAX {
+            match active_receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(JobUpdate::Phase("Starting media pipeline")) => {
+                    active_phase_seen = true;
+                    active_cancelled.store(true, Ordering::Release);
+                }
+                Ok(JobUpdate::Cancelled) => {
+                    active_cancellation_reported = true;
+                    break;
+                }
+                Ok(JobUpdate::Phase(_) | JobUpdate::Progress { .. }) => {}
+                Ok(JobUpdate::Completed { .. }) => {
+                    panic!("active cancellation must not complete the pipeline")
+                }
+                Ok(JobUpdate::Failed(error)) => {
+                    panic!("active cancellation failed instead of cancelling: {error}")
+                }
+                Err(error) => panic!("active cancellation update failed: {error}"),
+            }
+        }
+        active_worker
+            .join()
+            .expect("actively cancelled worker must exit cleanly");
+        assert!(
+            active_phase_seen,
+            "cancellation must occur after media startup"
+        );
+        assert!(
+            active_cancellation_reported,
+            "active cancellation must report its terminal state"
+        );
+        assert!(
+            !active_cancelled_output_path.exists(),
+            "active cancellation must not publish output"
+        );
+        let active_partial_path = partial_output_path(&active_cancelled_output_path)
+            .expect("active cancellation partial path must be valid");
+        assert!(
+            !active_partial_path.exists(),
+            "active cancellation must remove partial output"
         );
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1648,7 +1665,54 @@ mod tests {
             (0.9..=1.1).contains(&output_metadata.duration_seconds),
             "output duration must preserve the one-second source timeline"
         );
+        let audio_probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&output_path)
+            .output()
+            .expect("output audio probe should start");
+        assert!(
+            audio_probe.status.success(),
+            "copied output audio must be probeable"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&audio_probe.stdout).trim(),
+            "audio",
+            "pipeline must preserve the source audio stream"
+        );
+        let subtitle_probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "s:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&output_path)
+            .output()
+            .expect("output subtitle probe should start");
+        assert!(
+            subtitle_probe.status.success(),
+            "copied output subtitle must be probeable"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&subtitle_probe.stdout).trim(),
+            "subtitle",
+            "pipeline must preserve the compatible source subtitle stream"
+        );
         let _ = fs::remove_file(input_path);
         let _ = fs::remove_file(output_path);
+        let _ = fs::remove_file(subtitle_path);
     }
 }

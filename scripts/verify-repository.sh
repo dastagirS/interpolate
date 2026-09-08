@@ -23,11 +23,13 @@ test -s legal/SOURCE-PROVENANCE.md
 test -s .github/CODEOWNERS
 grep -Fq '/.github/workflows/ @dastagirS' .github/CODEOWNERS
 grep -Fq '/scripts/quality-gate.sh @dastagirS' .github/CODEOWNERS
+grep -Fq '/scripts/install-ci-dependencies.sh @dastagirS' .github/CODEOWNERS
+grep -Fq '/scripts/configure-ci-vulkan.sh @dastagirS' .github/CODEOWNERS
 grep -Fq "$PARAMETER_SHA256" legal/SOURCE-PROVENANCE.md
 grep -Fq "$WEIGHTS_SHA256" legal/SOURCE-PROVENANCE.md
 
-if git ls-files --error-unmatch plan.md >/dev/null 2>&1; then
-    echo 'plan.md must remain local and untracked' >&2
+if [ -e plan.md ] || git ls-files --error-unmatch plan.md >/dev/null 2>&1; then
+    echo 'obsolete plan.md must not exist or be tracked' >&2
     exit 1
 fi
 
@@ -39,6 +41,15 @@ if [ -n "$forbidden_paths" ]; then
 fi
 
 git diff --check
+git diff --cached --check
+
+unpinned_actions=$(grep -RhoE 'uses: [^[:space:]]+' .github/workflows \
+    | grep -Ev '@[0-9a-f]{40}$' || true)
+if [ -n "$unpinned_actions" ]; then
+    echo 'GitHub Actions must be pinned to full commit hashes:' >&2
+    printf '%s\n' "$unpinned_actions" >&2
+    exit 1
+fi
 
 script_count=0
 for script_path in scripts/*.sh; do

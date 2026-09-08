@@ -4,6 +4,10 @@ A native Linux desktop application for GPU video frame interpolation. The interf
 
 > Interpolate is under active development. Keep the original source video until you have verified the generated output.
 
+## Architecture
+
+The executable enters through a small `main` module. The deep desktop application module owns GPUI state, rendering, background-mode policy, and coordinated shutdown behind one `run` interface. Media orchestration remains in the pipeline module, while cadence classification, output scheduling, persistent logging, the system-tray adapter, and the native backend each have focused modules. This keeps Content preset decisions local to cadence processing without exposing native or FFmpeg details to the interface.
+
 ## Current capabilities
 
 - RIFE 4.25 interpolation on Vulkan GPUs
@@ -15,7 +19,9 @@ A native Linux desktop application for GPU video frame interpolation. The interf
 - Automatic half-scale UHD flow for 4K Anime sources with manual override
 - Original audio and compatible subtitles copied into MKV output
 - Bounded memory: three RGB24 frame buffers, one active job, one inference call
-- Progress, output FPS, cancellation, partial-file cleanup, and atomic completion
+- Progress, output FPS, cancellation, atomic completion, and recoverable failed partial outputs
+- Bounded FFmpeg diagnostics with five rotating 1 MiB logs and 200 recent in-memory lines
+- Optional background processing through the Linux system tray
 - Native source picker, output picker, FPS input, and Vulkan device selector
 - Input/output paths accepted through the UI or as the first two command-line arguments
 - Anime diagnostics for detected held frames and smoothed cadence runs
@@ -103,7 +109,11 @@ After extracting the archive, launch the application through its top-level wrapp
 ./interpolate
 ```
 
-The target system must still provide a Vulkan driver, `ffmpeg`, and `ffprobe`.
+The target system must still provide a Vulkan driver, `ffmpeg`, and `ffprobe`. Background mode additionally requires a desktop implementing the freedesktop StatusNotifierItem system-tray protocol. On GNOME, that commonly requires an AppIndicator extension.
+
+## Diagnostics
+
+Each job writes bounded application, ffprobe, decoder, and encoder diagnostics to `$XDG_STATE_HOME/interpolate/interpolate.log`, or `~/.local/state/interpolate/interpolate.log` when `XDG_STATE_HOME` is unset. Five 1 MiB files are retained. Cancellation removes partial output; processing failures preserve a partial MKV when one exists and report its location for possible recovery.
 
 ## License
 

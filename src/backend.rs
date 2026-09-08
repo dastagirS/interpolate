@@ -4,13 +4,15 @@ use std::{
     ptr::NonNull,
 };
 
-const BACKEND_ABI_VERSION: u32 = 1;
+const BACKEND_ABI_VERSION: u32 = 2;
 const ERROR_MESSAGE_SIZE: usize = 512;
 const GPU_NAME_SIZE: usize = 256;
 const RGB_CHANNEL_COUNT: usize = 3;
 const CPU_THREAD_COUNT_MIN: i32 = 1;
 const CPU_THREAD_COUNT_MAX: i32 = 16;
 const STATUS_OK: i32 = 0;
+#[cfg(test)]
+const STATUS_INVALID_ARGUMENT: i32 = 1;
 
 #[repr(C)]
 struct NativeBackendConfiguration {
@@ -48,7 +50,9 @@ unsafe extern "C" {
     fn interpolate_backend_process_rgb24(
         backend: *mut NativeBackend,
         frame_before: *const c_uchar,
+        frame_before_size: usize,
         frame_after: *const c_uchar,
+        frame_after_size: usize,
         width: c_uint,
         height: c_uint,
         row_stride: usize,
@@ -85,6 +89,12 @@ impl Backend {
             "thread limits must be ordered"
         );
 
+        let native_abi_version = unsafe { interpolate_backend_abi_version() };
+        if native_abi_version != BACKEND_ABI_VERSION {
+            return Err(format!(
+                "native ABI version {native_abi_version} does not match required version {BACKEND_ABI_VERSION}"
+            ));
+        }
         let model_directory_bytes = path_bytes(model_directory)?;
         let configuration = NativeBackendConfiguration {
             gpu_index,
@@ -113,9 +123,8 @@ impl Backend {
             "validated model path must not be empty"
         );
         assert_eq!(
-            unsafe { interpolate_backend_abi_version() },
-            BACKEND_ABI_VERSION,
-            "backend ABI must remain compatible"
+            native_abi_version, BACKEND_ABI_VERSION,
+            "validated backend ABI must remain compatible"
         );
         Ok(Self { native })
     }
@@ -157,7 +166,9 @@ impl Backend {
             interpolate_backend_process_rgb24(
                 self.native.as_ptr(),
                 frame_before.as_ptr(),
+                frame_before.len(),
                 frame_after.as_ptr(),
+                frame_after.len(),
                 width,
                 height,
                 row_stride,
@@ -357,6 +368,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_abi_rejects_small_outputs_without_aborting() {
+        let mut gpu_name = [0_i8; 1];
+        let mut error_message = [0_i8; ERROR_MESSAGE_SIZE];
+        let gpu_name_status = unsafe {
+            interpolate_backend_gpu_name(
+                0,
+                gpu_name.as_mut_ptr(),
+                gpu_name.len(),
+                error_message.as_mut_ptr(),
+                error_message.len(),
+            )
+        };
+        assert_eq!(gpu_name_status, STATUS_INVALID_ARGUMENT);
+        assert_eq!(gpu_name[0], 0, "rejected output must remain terminated");
+
+        let configuration = NativeBackendConfiguration {
+            gpu_index: 0,
+            cpu_thread_count: CPU_THREAD_COUNT_MIN,
+            use_uhd_mode: 0,
+        };
+        let model_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/rife-v4.25");
+        let model_directory_bytes = path_bytes(&model_directory).expect("model path must be valid");
+        let create_status = unsafe {
+            interpolate_backend_create(
+                &configuration,
+                model_directory_bytes.as_ptr().cast(),
+                model_directory_bytes.len(),
+                std::ptr::null_mut(),
+                error_message.as_mut_ptr(),
+                error_message.len(),
+            )
+        };
+        assert_eq!(create_status, STATUS_INVALID_ARGUMENT);
+        assert!(!c_buffer_to_string(&error_message).is_empty());
+
+        let mut native = std::ptr::null_mut();
+        let model_directory_with_null = b"/tmp/interpolate\0invalid";
+        error_message.fill(0);
+        let null_path_status = unsafe {
+            interpolate_backend_create(
+                &configuration,
+                model_directory_with_null.as_ptr().cast(),
+                model_directory_with_null.len(),
+                &mut native,
+                error_message.as_mut_ptr(),
+                error_message.len(),
+            )
+        };
+        assert_eq!(null_path_status, STATUS_INVALID_ARGUMENT);
+        assert!(
+            native.is_null(),
+            "rejected model path must not create a backend"
+        );
+    }
+
+    #[test]
     fn native_backend_interpolates_fixed_rgb_frames() {
         const WIDTH: u32 = 64;
         const HEIGHT: u32 = 64;
@@ -381,6 +448,27 @@ mod tests {
         let frame_after = vec![255_u8; FRAME_SIZE];
         let mut frame_output = vec![0_u8; FRAME_SIZE];
         let short_frame = vec![0_u8; FRAME_SIZE - 1];
+        let mut native_error_message = [0_i8; ERROR_MESSAGE_SIZE];
+        let native_size_status = unsafe {
+            interpolate_backend_process_rgb24(
+                backend.native.as_ptr(),
+                frame_before.as_ptr(),
+                short_frame.len(),
+                frame_after.as_ptr(),
+                frame_after.len(),
+                WIDTH,
+                HEIGHT,
+                WIDTH as usize * RGB_CHANNEL_COUNT,
+                0.5,
+                frame_output.as_mut_ptr(),
+                frame_output.len(),
+                native_error_message.as_mut_ptr(),
+                native_error_message.len(),
+            )
+        };
+        assert_eq!(native_size_status, STATUS_INVALID_ARGUMENT);
+        assert!(frame_output.iter().all(|value| *value == 0));
+
         let invalid_size_error = backend
             .interpolate_rgb24(
                 &short_frame,
