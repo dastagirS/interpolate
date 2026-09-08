@@ -83,7 +83,7 @@ See `legal/` and the license files retained inside `native/vendor/` for attribut
 
 ## Releases
 
-Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. A manual workflow run builds the same downloadable artifact without creating a GitHub release.
+Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. A manual workflow run requires a `v`-prefixed release tag and creates the same GitHub release from the selected commit. If that release already exists, the workflow stops before installing dependencies or building.
 
 After extracting the archive, launch the application through its top-level wrapper so it can locate the packaged native library:
 

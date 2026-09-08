@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,6 +27,45 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Configure release metadata
+        env:
+          MANUAL_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            release_tag="$MANUAL_RELEASE_TAG"
+          else
+            release_tag="$GITHUB_REF_NAME"
+          fi
+          test -n "$release_tag"
+          test "${#release_tag}" -le 64
+          if [[ ! "$release_tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo 'Release tag must start with v and contain only letters, numbers, dots, underscores, or hyphens.' >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=interpolate-${release_tag}-linux-x86_64" >> "$GITHUB_ENV"
+
+      - name: Stop if release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$GITHUB_REPOSITORY"
+          test -n "$RELEASE_TAG"
+          error_file=$(mktemp)
+          trap 'rm -f "$error_file"' EXIT
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            >/dev/null 2>"$error_file"; then
+            echo "Release ${RELEASE_TAG} already exists; stopping before the build." >&2
+            exit 1
+          fi
+          if ! grep -q 'HTTP 404' "$error_file"; then
+            cat "$error_file" >&2
+            echo 'Could not determine whether the release already exists.' >&2
+            exit 1
+          fi
 
       - name: Install build dependencies
         run: |
@@ -69,12 +113,9 @@ jobs:
       - name: Package release
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            release_version="$GITHUB_REF_NAME"
-          else
-            release_version="manual-${GITHUB_SHA:0:7}"
-          fi
-          archive_name="interpolate-${release_version}-linux-x86_64"
+          test -n "$RELEASE_TAG"
+          test -n "$ARCHIVE_NAME"
+          archive_name="$ARCHIVE_NAME"
           package_root="dist/${archive_name}"
 
           mapfile -t backend_libraries < <(find target/release/build \
@@ -116,7 +157,6 @@ jobs:
           sha256sum "artifacts/${archive_name}.tar.gz" > "artifacts/${archive_name}.tar.gz.sha256"
           test -s "artifacts/${archive_name}.tar.gz"
           test -s "artifacts/${archive_name}.tar.gz.sha256"
-          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -127,17 +167,13 @@ jobs:
           retention-days: 14
 
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -n "$GITHUB_REF_NAME"
+          test -n "$RELEASE_TAG"
           test -s "artifacts/${ARCHIVE_NAME}.tar.gz"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" artifacts/* \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes
-          fi
+          gh release create "$RELEASE_TAG" artifacts/* \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --generate-notes
