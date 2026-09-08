@@ -41,6 +41,37 @@ const PRIMARY_BUTTON_TEXT_COLOR: u32 = 0x0a0a0a;
 const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const PROGRESS_POLL_COUNT_MAX: usize = 4_838_400;
 const UPDATE_DRAIN_COUNT_MAX: usize = 4;
+const SECONDS_PER_MINUTE: u64 = 60;
+const MINUTES_PER_HOUR: u64 = 60;
+const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+
+fn format_remaining_time(remaining_seconds: u64) -> String {
+    assert!(
+        SECONDS_PER_MINUTE > 0,
+        "seconds per minute must be positive"
+    );
+    assert_eq!(
+        SECONDS_PER_HOUR,
+        SECONDS_PER_MINUTE * MINUTES_PER_HOUR,
+        "hour conversion must remain exact"
+    );
+
+    let hours = remaining_seconds / SECONDS_PER_HOUR;
+    let minutes = (remaining_seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+    let seconds = remaining_seconds % SECONDS_PER_MINUTE;
+    let formatted = if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02} remaining")
+    } else {
+        format!("{minutes}:{seconds:02} remaining")
+    };
+
+    assert!(!formatted.is_empty(), "remaining time must be displayed");
+    assert!(
+        formatted.ends_with(" remaining"),
+        "remaining time must retain its label"
+    );
+    formatted
+}
 
 struct InterpolateApp {
     input_path: Option<PathBuf>,
@@ -657,11 +688,7 @@ impl Render for InterpolateApp {
             let remaining_seconds = ((self.frame_count_estimate - self.frame_count) as f64
                 / self.processing_fps)
                 .ceil() as u64;
-            format!(
-                "{}:{:02} remaining",
-                remaining_seconds / 60,
-                remaining_seconds % 60
-            )
+            format_remaining_time(remaining_seconds)
         } else {
             "—".to_owned()
         };
@@ -1451,6 +1478,23 @@ impl Drop for InterpolateApp {
             (0.0..=1.0).contains(&self.progress),
             "progress must remain bounded during shutdown"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_remaining_time;
+
+    #[test]
+    fn remaining_time_uses_hours_for_long_jobs() {
+        assert_eq!(format_remaining_time(11_558), "3:12:38 remaining");
+        assert_eq!(format_remaining_time(18_758), "5:12:38 remaining");
+    }
+
+    #[test]
+    fn remaining_time_keeps_minutes_for_short_jobs() {
+        assert_eq!(format_remaining_time(758), "12:38 remaining");
+        assert_eq!(format_remaining_time(59), "0:59 remaining");
     }
 }
 
