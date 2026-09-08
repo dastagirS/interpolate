@@ -28,8 +28,24 @@ test -s Cargo.toml
 test -s Cargo.lock
 run_cargo fmt --all -- --check
 "$REPOSITORY_ROOT/scripts/verify-repository.sh"
-# Constant assertions are intentional executable documentation of safety limits.
-run_cargo clippy --locked --all-targets -- -D warnings -A clippy::assertions-on-constants
-run_cargo test --locked -- --test-threads=1
+# The release workflow uses one Cargo profile for Clippy, tests, and packaging so
+# the expensive Rust and native dependencies are compiled only once.
+case "${QUALITY_GATE_PROFILE:-development}" in
+    development)
+        # Constant assertions are intentional executable documentation of safety limits.
+        run_cargo clippy --locked --all-targets -- -D warnings -A clippy::assertions-on-constants
+        run_cargo test --locked -- --test-threads=1
+        ;;
+    release)
+        # Build and test first so Clippy can reuse release-profile dependency artifacts.
+        run_cargo test --locked --release -- --test-threads=1
+        # Constant assertions are intentional executable documentation of safety limits.
+        run_cargo clippy --locked --release --all-targets -- -D warnings -A clippy::assertions-on-constants
+        ;;
+    *)
+        echo 'QUALITY_GATE_PROFILE must be development or release' >&2
+        exit 2
+        ;;
+esac
 
-printf 'quality gate passed\n'
+printf 'quality gate passed (%s profile)\n' "${QUALITY_GATE_PROFILE:-development}"
