@@ -99,18 +99,24 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Verify software Vulkan
-        env:
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      - name: Configure software Vulkan
         run: |
           set -euo pipefail
-          test -r "$VK_ICD_FILENAMES"
-          vulkaninfo --summary
+          shopt -s nullglob
+          lavapipe_icd_files=(
+            /usr/share/vulkan/icd.d/lvp_icd*.json
+            /etc/vulkan/icd.d/lvp_icd*.json
+          )
+          test "${#lavapipe_icd_files[@]}" -ge 1
+          test "${#lavapipe_icd_files[@]}" -le 4
+          lavapipe_icd_file="${lavapipe_icd_files[0]}"
+          test -r "$lavapipe_icd_file"
+          echo "VK_ICD_FILENAMES=$lavapipe_icd_file" >> "$GITHUB_ENV"
+          VK_ICD_FILENAMES="$lavapipe_icd_file" vulkaninfo --summary
 
       - name: Run release-blocking battle tests
         env:
           CI: "true"
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: scripts/quality-gate.sh
 
       - name: Build release
