@@ -1,0 +1,143 @@
+name: Release Linux build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xinput-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+          CMAKE_BUILD_PARALLEL_LEVEL: "1"
+        run: |
+          set -euo pipefail
+          memory_available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+          memory_required_kib=$((5 * 1024 * 1024))
+          test -n "$memory_available_kib"
+          test "$memory_available_kib" -ge "$memory_required_kib"
+          ulimit -v $((6 * 1024 * 1024))
+          cargo build --release --locked --jobs 1
+          test -x target/release/interpolate
+          test -s target/release/interpolate
+
+      - name: Package release
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release_version="$GITHUB_REF_NAME"
+          else
+            release_version="manual-${GITHUB_SHA:0:7}"
+          fi
+          archive_name="interpolate-${release_version}-linux-x86_64"
+          package_root="dist/${archive_name}"
+
+          mapfile -t backend_libraries < <(find target/release/build \
+            -path '*/out/native-build/libinterpolate_backend.so' -type f -print)
+          test "${#backend_libraries[@]}" -eq 1
+          test -s "${backend_libraries[0]}"
+
+          mkdir -p \
+            "$package_root/bin" \
+            "$package_root/lib" \
+            "$package_root/share/interpolate/models/rife-v4.25" \
+            artifacts
+          install -m 0755 target/release/interpolate "$package_root/bin/interpolate"
+          install -m 0755 "${backend_libraries[0]}" "$package_root/lib/libinterpolate_backend.so"
+          install -m 0644 models/rife-v4.25/flownet.param \
+            "$package_root/share/interpolate/models/rife-v4.25/flownet.param"
+          install -m 0644 models/rife-v4.25/flownet.bin \
+            "$package_root/share/interpolate/models/rife-v4.25/flownet.bin"
+          install -m 0644 README.md LICENSE "$package_root/"
+
+          cat > "$package_root/interpolate" <<'LAUNCHER'
+          #!/bin/sh
+          set -eu
+          installation_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          test -n "$installation_root"
+          test -x "$installation_root/bin/interpolate"
+          export LD_LIBRARY_PATH="$installation_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$installation_root/bin/interpolate" "$@"
+          LAUNCHER
+          chmod 0755 "$package_root/interpolate"
+
+          LD_LIBRARY_PATH="$package_root/lib" ldd "$package_root/bin/interpolate" | tee dist/ldd.txt
+          if grep -q 'not found' dist/ldd.txt; then
+            echo 'Packaged executable has unresolved shared libraries.' >&2
+            exit 1
+          fi
+
+          tar --create --gzip --directory dist --file "artifacts/${archive_name}.tar.gz" "$archive_name"
+          sha256sum "artifacts/${archive_name}.tar.gz" > "artifacts/${archive_name}.tar.gz.sha256"
+          test -s "artifacts/${archive_name}.tar.gz"
+          test -s "artifacts/${archive_name}.tar.gz.sha256"
+          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$GITHUB_REF_NAME"
+          test -s "artifacts/${ARCHIVE_NAME}.tar.gz"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi

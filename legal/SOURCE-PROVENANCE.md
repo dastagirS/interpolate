@@ -16,6 +16,8 @@ glslang       fe88f421038e1bb0a25cd5c1b2dfe505db82d08f
 Vulkan-Headers v1.4.341
 ```
 
+The vendored ncnn build excludes its examples, example model binaries, tools, tests, and benchmarks at configuration time. Example sources and weights are not distributed with Interpolate because they are unrelated to RIFE inference.
+
 Model checksums:
 
 ```text

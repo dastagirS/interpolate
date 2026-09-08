@@ -79,7 +79,19 @@ Optionally preselect paths:
 - Vulkan Headers: `v1.4.341`
 - Model: `rife-v4.25/flownet.param` and `flownet.bin` from the pinned RIFE fork
 
-See `legal/` and the license files retained inside `native/vendor/` for attribution and redistribution terms.
+See `legal/` and the license files retained inside `native/vendor/` for attribution and redistribution terms. The RIFE `flownet.bin` model is intentionally versioned because the application cannot perform inference without it; unrelated ncnn example models are excluded.
+
+## Releases
+
+Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. A manual workflow run builds the same downloadable artifact without creating a GitHub release.
+
+After extracting the archive, launch the application through its top-level wrapper so it can locate the packaged native library:
+
+```sh
+./interpolate
+```
+
+The target system must still provide a Vulkan driver, `ffmpeg`, and `ffprobe`.
 
 ## License
 

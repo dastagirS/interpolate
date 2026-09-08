@@ -22,6 +22,8 @@ const FFMPEG_THREAD_COUNT: &str = "2";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const SCENE_SAMPLE_STEP: usize = 4;
 const SCENE_THRESHOLD_DEFAULT: f32 = 0.15;
+const MODEL_DIRECTORY_ENVIRONMENT: &str = "INTERPOLATE_MODEL_DIRECTORY";
+const MODEL_DIRECTORY_RELATIVE: &str = "share/interpolate/models/rife-v4.25";
 
 #[derive(Clone)]
 pub struct JobConfiguration {
@@ -234,6 +236,92 @@ pub fn run_job(
     );
 }
 
+fn resolve_model_directory() -> Result<PathBuf, String> {
+    assert!(
+        !MODEL_DIRECTORY_ENVIRONMENT.is_empty(),
+        "model environment variable must be named"
+    );
+    assert!(
+        !MODEL_DIRECTORY_RELATIVE.is_empty(),
+        "installed model path must be configured"
+    );
+
+    if let Some(value) = std::env::var_os(MODEL_DIRECTORY_ENVIRONMENT) {
+        if value.is_empty() {
+            return Err(format!("{MODEL_DIRECTORY_ENVIRONMENT} must not be empty"));
+        }
+        let model_directory = PathBuf::from(value);
+        if !model_files_exist(&model_directory) {
+            return Err(format!(
+                "{MODEL_DIRECTORY_ENVIRONMENT} does not contain the RIFE 4.25 model"
+            ));
+        }
+        assert!(
+            model_directory.is_dir(),
+            "validated model path must be a directory"
+        );
+        assert!(
+            model_files_exist(&model_directory),
+            "validated model files must exist"
+        );
+        return Ok(model_directory);
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate the application executable: {error}"))?;
+    if let Some(installation_root) = executable.parent().and_then(Path::parent) {
+        let installed_directory = installation_root.join(MODEL_DIRECTORY_RELATIVE);
+        if model_files_exist(&installed_directory) {
+            assert!(
+                installed_directory.is_dir(),
+                "installed model path must be a directory"
+            );
+            assert!(
+                model_files_exist(&installed_directory),
+                "installed model files must exist"
+            );
+            return Ok(installed_directory);
+        }
+    }
+
+    let development_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/rife-v4.25");
+    if !model_files_exist(&development_directory) {
+        return Err("RIFE 4.25 model files could not be located".to_owned());
+    }
+    assert!(
+        development_directory.is_dir(),
+        "development model path must be a directory"
+    );
+    assert!(
+        model_files_exist(&development_directory),
+        "development model files must exist"
+    );
+    Ok(development_directory)
+}
+
+fn model_files_exist(model_directory: &Path) -> bool {
+    assert!(
+        !model_directory.as_os_str().is_empty(),
+        "model directory must not be empty"
+    );
+    assert!(
+        !MODEL_DIRECTORY_RELATIVE.is_empty(),
+        "model relative path must remain configured"
+    );
+    let files_exist = model_directory.is_dir()
+        && model_directory.join("flownet.param").is_file()
+        && model_directory.join("flownet.bin").is_file();
+    assert!(
+        !files_exist || model_directory.is_dir(),
+        "model files require a containing directory"
+    );
+    assert!(
+        !files_exist || model_directory.join("flownet.param").is_file(),
+        "a valid model requires its parameter file"
+    );
+    files_exist
+}
+
 fn run_job_inner(
     configuration: &JobConfiguration,
     cancelled: &AtomicBool,
@@ -256,7 +344,7 @@ fn run_job_inner(
     }
 
     send_update(updates, JobUpdate::Phase("Initializing RIFE 4.25"));
-    let model_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/rife-v4.25");
+    let model_directory = resolve_model_directory()?;
     let mut backend = Backend::create(
         &model_directory,
         configuration.gpu_index,

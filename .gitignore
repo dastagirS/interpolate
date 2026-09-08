@@ -1,5 +1,12 @@
-# Rust and native build output
+# Rust, native, and release build output
 /target/
+/dist/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
 
 # Local media used for manual testing
 /sample*.mp4
