@@ -9,12 +9,16 @@ A native Linux desktop application for GPU video frame interpolation. The interf
 - RIFE 4.25 interpolation on Vulkan GPUs
 - Configurable output rate from 1 to 480 FPS
 - Streaming FFmpeg decode and encode without extracting frames to disk
-- Scene-cut protection with a `0.15` difference threshold
+- Movie and Anime content presets with deterministic defaults
+- Conservative Anime cadence protection for two- and three-frame held drawings
+- Scene-cut protection with a `0.15` difference threshold; always enabled for Anime
+- Automatic half-scale UHD flow for 4K Anime sources with manual override
 - Original audio and compatible subtitles copied into MKV output
 - Bounded memory: three RGB24 frame buffers, one active job, one inference call
 - Progress, output FPS, cancellation, partial-file cleanup, and atomic completion
 - Native source picker, output picker, FPS input, and Vulkan device selector
 - Input/output paths accepted through the UI or as the first two command-line arguments
+- Anime diagnostics for detected held frames and smoothed cadence runs
 
 The default output name is:
 
@@ -51,6 +55,14 @@ Use the provided wrapper. It checks for at least 5 GiB of available memory, appl
 
 The first native build is substantially longer than later incremental builds.
 
+Before proposing or releasing a change, run the same release-blocking quality gate used by GitHub Actions:
+
+```sh
+./scripts/quality-gate.sh
+```
+
+It verifies formatting, model checksums, repository hygiene, Clippy warnings, the native ABI, cadence edge cases, cancellation, FFmpeg integration, and an end-to-end RIFE encode. Tests are serialized because the native backend intentionally permits only one active instance.
+
 ## Run
 
 ```sh
@@ -83,7 +95,7 @@ See `legal/` and the license files retained inside `native/vendor/` for attribut
 
 ## Releases
 
-Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. A manual workflow run requires a `v`-prefixed release tag and creates the same GitHub release from the selected commit. If that release already exists, the workflow stops before installing dependencies or building.
+Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow must pass the complete quality gate before it performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. A manual workflow run requires a `v`-prefixed release tag and creates the same GitHub release from the selected commit. If that release already exists, the workflow stops before installing dependencies or building.
 
 After extracting the archive, launch the application through its top-level wrapper so it can locate the packaged native library:
 

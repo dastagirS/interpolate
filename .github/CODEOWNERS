@@ -1,0 +1,6 @@
+# Release and test gates require explicit repository-owner review.
+/.github/workflows/ @dastagirS
+/scripts/quality-gate.sh @dastagirS
+/scripts/verify-repository.sh @dastagirS
+/models/rife-v4.25/ @dastagirS
+/legal/SOURCE-PROVENANCE.md @dastagirS

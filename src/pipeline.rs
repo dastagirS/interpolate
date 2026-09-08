@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,10 +20,34 @@ const OUTPUT_FRAME_COUNT_MAX: u64 = 100_000_000;
 const TARGET_FPS_MAX: u32 = 480;
 const FFMPEG_THREAD_COUNT: &str = "2";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-const SCENE_SAMPLE_STEP: usize = 4;
-const SCENE_THRESHOLD_DEFAULT: f32 = 0.15;
+const FRAME_SAMPLE_STEP: usize = 4;
+const SCENE_THRESHOLD_DEFAULT: f64 = 0.15;
+const DUPLICATE_MEAN_DIFFERENCE_MAX: f64 = 0.006;
+const DUPLICATE_CHANGED_PIXEL_RATIO_MAX: f64 = 0.005;
+const DUPLICATE_TILE_DIFFERENCE_MAX: f64 = 0.01;
+const DUPLICATE_PIXEL_DIFFERENCE_MIN: u32 = 4 * 256;
+const DIFFERENCE_TILE_COLUMN_COUNT: usize = 8;
+const DIFFERENCE_TILE_ROW_COUNT: usize = 8;
+const DIFFERENCE_TILE_COUNT: usize = DIFFERENCE_TILE_COLUMN_COUNT * DIFFERENCE_TILE_ROW_COUNT;
+const CADENCE_RUN_FRAME_COUNT_MIN: u64 = 2;
+const CADENCE_RUN_FRAME_COUNT_MAX: u64 = 3;
 const MODEL_DIRECTORY_ENVIRONMENT: &str = "INTERPOLATE_MODEL_DIRECTORY";
 const MODEL_DIRECTORY_RELATIVE: &str = "share/interpolate/models/rife-v4.25";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentPreset {
+    Anime,
+    Movie,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CadenceDiagnostics {
+    pub duplicate_frame_count: u64,
+    pub cadence_run_count: u64,
+    pub long_hold_count: u64,
+    pub scene_cut_count: u64,
+    pub inference_bypass_count: u64,
+}
 
 #[derive(Clone)]
 pub struct JobConfiguration {
@@ -32,6 +56,7 @@ pub struct JobConfiguration {
     pub target_fps_num: u32,
     pub target_fps_den: u32,
     pub gpu_index: i32,
+    pub content_preset: ContentPreset,
     pub scene_detection: bool,
     pub use_uhd_mode: bool,
 }
@@ -44,8 +69,12 @@ pub enum JobUpdate {
         frame_count_estimate: u64,
         processing_fps: f64,
         progress: f32,
+        cadence_diagnostics: CadenceDiagnostics,
     },
-    Completed(PathBuf),
+    Completed {
+        path: PathBuf,
+        cadence_diagnostics: CadenceDiagnostics,
+    },
     Cancelled,
     Failed(String),
 }
@@ -221,7 +250,10 @@ pub fn run_job(
     );
     let result = run_job_inner(&configuration, &cancelled, &updates);
     let terminal_update = match result {
-        Ok(()) => JobUpdate::Completed(configuration.output_path.clone()),
+        Ok(cadence_diagnostics) => JobUpdate::Completed {
+            path: configuration.output_path.clone(),
+            cadence_diagnostics,
+        },
         Err(_) if cancelled.load(Ordering::Acquire) => JobUpdate::Cancelled,
         Err(error) => JobUpdate::Failed(error),
     };
@@ -326,7 +358,7 @@ fn run_job_inner(
     configuration: &JobConfiguration,
     cancelled: &AtomicBool,
     updates: &SyncSender<JobUpdate>,
-) -> Result<(), String> {
+) -> Result<CadenceDiagnostics, String> {
     assert!(
         configuration.target_fps_num > 0,
         "target FPS must be positive"
@@ -367,7 +399,7 @@ fn run_job_inner(
         }
     };
 
-    let processing_result = process_frames(
+    let cadence_diagnostics = match process_frames(
         configuration,
         &metadata,
         cancelled,
@@ -375,13 +407,15 @@ fn run_job_inner(
         &mut backend,
         &mut decoder,
         &mut encoder,
-    );
-    if processing_result.is_err() {
-        terminate_child(&mut decoder);
-        terminate_child(&mut encoder);
-        let _ = fs::remove_file(&partial_path);
-        return processing_result;
-    }
+    ) {
+        Ok(cadence_diagnostics) => cadence_diagnostics,
+        Err(error) => {
+            terminate_child(&mut decoder);
+            terminate_child(&mut encoder);
+            let _ = fs::remove_file(&partial_path);
+            return Err(error);
+        }
+    };
 
     send_update(updates, JobUpdate::Phase("Finalizing output"));
     let decoder_status = decoder
@@ -410,7 +444,7 @@ fn run_job_inner(
         !partial_path.exists(),
         "partial output must be gone after rename"
     );
-    Ok(())
+    Ok(cadence_diagnostics)
 }
 
 fn validate_configuration(configuration: &JobConfiguration) -> Result<(), String> {
@@ -589,6 +623,247 @@ fn spawn_encoder(
     Ok(child)
 }
 
+struct OutputScheduler<'a> {
+    factor_num: u128,
+    factor_den: u128,
+    frame_count_estimate: u64,
+    output_index: u64,
+    started_at: Instant,
+    progress_at: Instant,
+    metadata: &'a VideoMetadata,
+    cancelled: &'a AtomicBool,
+    updates: &'a SyncSender<JobUpdate>,
+    backend: &'a mut Backend,
+    encoder_input: &'a mut ChildStdin,
+    frame_output: Vec<u8>,
+    cadence_diagnostics: CadenceDiagnostics,
+}
+
+impl<'a> OutputScheduler<'a> {
+    fn new(
+        configuration: &JobConfiguration,
+        metadata: &'a VideoMetadata,
+        cancelled: &'a AtomicBool,
+        updates: &'a SyncSender<JobUpdate>,
+        backend: &'a mut Backend,
+        encoder_input: &'a mut ChildStdin,
+        frame_size: usize,
+    ) -> Self {
+        assert!(
+            configuration.target_fps_num > 0,
+            "target FPS must be positive"
+        );
+        assert!(metadata.source_fps_num > 0, "source FPS must be positive");
+        let factor_num =
+            u128::from(configuration.target_fps_num) * u128::from(metadata.source_fps_den);
+        let factor_den =
+            u128::from(configuration.target_fps_den) * u128::from(metadata.source_fps_num);
+        let frame_count_estimate = ((metadata.duration_seconds
+            * f64::from(configuration.target_fps_num)
+            / f64::from(configuration.target_fps_den))
+        .ceil() as u64)
+            .clamp(1, OUTPUT_FRAME_COUNT_MAX);
+        let started_at = Instant::now();
+        let scheduler = Self {
+            factor_num,
+            factor_den,
+            frame_count_estimate,
+            output_index: 0,
+            started_at,
+            progress_at: started_at,
+            metadata,
+            cancelled,
+            updates,
+            backend,
+            encoder_input,
+            frame_output: vec![0_u8; frame_size],
+            cadence_diagnostics: CadenceDiagnostics::default(),
+        };
+        assert!(
+            scheduler.factor_num > scheduler.factor_den,
+            "target FPS must exceed source FPS"
+        );
+        assert_eq!(
+            scheduler.frame_output.len(),
+            frame_size,
+            "output frame must have the requested size"
+        );
+        scheduler
+    }
+
+    fn write_span(
+        &mut self,
+        frame_before: &[u8],
+        frame_after: &[u8],
+        source_index_start: u64,
+        source_index_end: u64,
+        interpolate: bool,
+    ) -> Result<(), String> {
+        assert!(
+            source_index_end > source_index_start,
+            "source span must be positive"
+        );
+        assert_eq!(
+            frame_before.len(),
+            self.frame_output.len(),
+            "source frame size must match output"
+        );
+        assert_eq!(
+            frame_after.len(),
+            self.frame_output.len(),
+            "endpoint frame size must match output"
+        );
+
+        let position_scaled_start = u128::from(source_index_start)
+            .checked_mul(self.factor_num)
+            .ok_or_else(|| "source span start overflowed".to_owned())?;
+        let position_scaled_end = u128::from(source_index_end)
+            .checked_mul(self.factor_num)
+            .ok_or_else(|| "source span end overflowed".to_owned())?;
+        let duration_scaled = position_scaled_end - position_scaled_start;
+
+        while self.output_index < OUTPUT_FRAME_COUNT_MAX {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err("job cancelled".to_owned());
+            }
+            let position_scaled = u128::from(self.output_index)
+                .checked_mul(self.factor_den)
+                .ok_or_else(|| "output frame position overflowed".to_owned())?;
+            if position_scaled >= position_scaled_end {
+                break;
+            }
+            if position_scaled < position_scaled_start {
+                return Err("output scheduler encountered an overlapping source span".to_owned());
+            }
+
+            let relative_scaled = position_scaled - position_scaled_start;
+            if interpolate && relative_scaled > 0 {
+                let timestep = (relative_scaled as f64 / duration_scaled as f64) as f32;
+                if !(0.0..1.0).contains(&timestep) {
+                    return Err("interpolation timestep escaped its source span".to_owned());
+                }
+                self.backend.interpolate_rgb24(
+                    frame_before,
+                    frame_after,
+                    self.metadata.width,
+                    self.metadata.height,
+                    timestep,
+                    &mut self.frame_output,
+                )?;
+                self.encoder_input
+                    .write_all(&self.frame_output)
+                    .map_err(|error| {
+                        format!("failed to send interpolated frame to encoder: {error}")
+                    })?;
+            } else {
+                self.encoder_input
+                    .write_all(frame_before)
+                    .map_err(|error| format!("failed to send source frame to encoder: {error}"))?;
+                if relative_scaled > 0 {
+                    self.cadence_diagnostics.inference_bypass_count = self
+                        .cadence_diagnostics
+                        .inference_bypass_count
+                        .saturating_add(1);
+                }
+            }
+            self.output_index = self
+                .output_index
+                .checked_add(1)
+                .ok_or_else(|| "output frame index overflowed".to_owned())?;
+            self.report_progress();
+        }
+        if self.output_index >= OUTPUT_FRAME_COUNT_MAX {
+            return Err(format!(
+                "output exceeds the {OUTPUT_FRAME_COUNT_MAX}-frame safety limit"
+            ));
+        }
+        assert!(
+            self.output_index < OUTPUT_FRAME_COUNT_MAX,
+            "output count must remain bounded"
+        );
+        assert!(
+            duration_scaled > 0,
+            "scaled source duration must be positive"
+        );
+        Ok(())
+    }
+
+    fn report_progress(&mut self) {
+        assert!(
+            self.frame_count_estimate > 0,
+            "estimated frame count must be positive"
+        );
+        assert!(
+            self.output_index < OUTPUT_FRAME_COUNT_MAX,
+            "reported frame count must be bounded"
+        );
+        let now = Instant::now();
+        if now.duration_since(self.progress_at) >= PROGRESS_INTERVAL {
+            let elapsed_seconds = now.duration_since(self.started_at).as_secs_f64().max(0.001);
+            let processing_fps = self.output_index as f64 / elapsed_seconds;
+            let progress = (self.output_index as f64 / self.frame_count_estimate as f64)
+                .clamp(0.0, 1.0) as f32;
+            send_update(
+                self.updates,
+                JobUpdate::Progress {
+                    frame_count: self.output_index,
+                    frame_count_estimate: self.frame_count_estimate,
+                    processing_fps,
+                    progress,
+                    cadence_diagnostics: self.cadence_diagnostics,
+                },
+            );
+            self.progress_at = now;
+        }
+        assert!(self.started_at <= now, "progress time must be monotonic");
+        assert!(
+            (0.0..=1.0).contains(
+                &(self.output_index as f64 / self.frame_count_estimate as f64).clamp(0.0, 1.0)
+            ),
+            "progress must remain bounded"
+        );
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        assert!(
+            self.output_index > 0,
+            "processing must produce at least one frame"
+        );
+        assert!(
+            self.output_index < OUTPUT_FRAME_COUNT_MAX,
+            "output must stay below its safety limit"
+        );
+        self.encoder_input
+            .flush()
+            .map_err(|error| format!("failed to flush encoder input: {error}"))?;
+        send_update(
+            self.updates,
+            JobUpdate::Progress {
+                frame_count: self.output_index,
+                frame_count_estimate: self.output_index,
+                processing_fps: self.output_index as f64
+                    / self.started_at.elapsed().as_secs_f64().max(0.001),
+                progress: 1.0,
+                cadence_diagnostics: self.cadence_diagnostics,
+            },
+        );
+        assert!(self.output_index > 0, "finished output must contain frames");
+        assert_eq!(
+            self.frame_output.len(),
+            checked_frame_size(self.metadata.width, self.metadata.height)?,
+            "working frame size must remain valid"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameDifference {
+    mean: f64,
+    changed_pixel_ratio: f64,
+    tile_mean_max: f64,
+}
+
 fn process_frames(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
@@ -597,7 +872,7 @@ fn process_frames(
     backend: &mut Backend,
     decoder: &mut Child,
     encoder: &mut Child,
-) -> Result<(), String> {
+) -> Result<CadenceDiagnostics, String> {
     assert!(metadata.source_fps_num > 0, "source FPS must be positive");
     assert!(
         configuration.target_fps_num > 0,
@@ -612,120 +887,193 @@ fn process_frames(
         .stdin
         .take()
         .ok_or_else(|| "encoder input pipe is unavailable".to_owned())?;
-    let mut frame_before = vec![0_u8; frame_size];
-    let mut frame_after = vec![0_u8; frame_size];
-    let mut frame_output = vec![0_u8; frame_size];
-    if !read_frame(&mut decoder_output, &mut frame_before)? {
+    let mut frame_anchor = vec![0_u8; frame_size];
+    let mut frame_candidate = vec![0_u8; frame_size];
+    if !read_frame(&mut decoder_output, &mut frame_anchor)? {
         return Err("decoder produced no video frames".to_owned());
     }
 
-    let factor_num = u128::from(configuration.target_fps_num) * u128::from(metadata.source_fps_den);
-    let factor_den = u128::from(configuration.target_fps_den) * u128::from(metadata.source_fps_num);
-    let frame_count_estimate = ((metadata.duration_seconds
-        * f64::from(configuration.target_fps_num)
-        / f64::from(configuration.target_fps_den))
-    .ceil() as u64)
-        .clamp(1, OUTPUT_FRAME_COUNT_MAX);
-    let started_at = Instant::now();
-    let mut progress_at = started_at;
-    let mut source_index = 0_u64;
-    let mut output_index = 0_u64;
+    let mut scheduler = OutputScheduler::new(
+        configuration,
+        metadata,
+        cancelled,
+        updates,
+        backend,
+        &mut encoder_input,
+        frame_size,
+    );
+    let anime_mode = configuration.content_preset == ContentPreset::Anime;
+    let scene_detection = configuration.scene_detection || anime_mode;
+    let mut anchor_index = 0_u64;
+    let mut candidate_index = 1_u64;
+    let mut cadence_run_frame_count = 1_u64;
+    let mut preserving_long_hold = false;
 
-    send_update(updates, JobUpdate::Phase("Interpolating and encoding"));
+    send_update(
+        updates,
+        JobUpdate::Phase(if anime_mode {
+            "Analyzing anime cadence, interpolating, and encoding"
+        } else {
+            "Interpolating and encoding"
+        }),
+    );
+
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err("job cancelled".to_owned());
         }
-        let has_next = read_frame(&mut decoder_output, &mut frame_after)?;
-        if !has_next {
-            frame_after.copy_from_slice(&frame_before);
-        }
-        let scene_change = has_next
-            && configuration.scene_detection
-            && scene_difference_rgb24(&frame_before, &frame_after, metadata.width, metadata.height)
-                >= SCENE_THRESHOLD_DEFAULT;
-
-        while output_index < OUTPUT_FRAME_COUNT_MAX {
-            let scaled_position = u128::from(output_index) * factor_den;
-            let real_source_index = scaled_position / factor_num;
-            if real_source_index != u128::from(source_index) {
-                break;
-            }
-            let remainder = scaled_position % factor_num;
-            if remainder == 0 || !has_next || scene_change {
-                encoder_input
-                    .write_all(&frame_before)
-                    .map_err(|error| format!("failed to send source frame to encoder: {error}"))?;
-            } else {
-                let timestep = (remainder as f64 / factor_num as f64) as f32;
-                backend.interpolate_rgb24(
-                    &frame_before,
-                    &frame_after,
-                    metadata.width,
-                    metadata.height,
-                    timestep,
-                    &mut frame_output,
-                )?;
-                encoder_input.write_all(&frame_output).map_err(|error| {
-                    format!("failed to send interpolated frame to encoder: {error}")
-                })?;
-            }
-            output_index += 1;
-
-            let now = Instant::now();
-            if now.duration_since(progress_at) >= PROGRESS_INTERVAL {
-                let elapsed_seconds = now.duration_since(started_at).as_secs_f64().max(0.001);
-                let processing_fps = output_index as f64 / elapsed_seconds;
-                let progress =
-                    (output_index as f64 / frame_count_estimate as f64).clamp(0.0, 1.0) as f32;
-                send_update(
-                    updates,
-                    JobUpdate::Progress {
-                        frame_count: output_index,
-                        frame_count_estimate,
-                        processing_fps,
-                        progress,
-                    },
-                );
-                progress_at = now;
-            }
-        }
-        if output_index >= OUTPUT_FRAME_COUNT_MAX {
+        if candidate_index >= OUTPUT_FRAME_COUNT_MAX {
             return Err(format!(
-                "output exceeds the {OUTPUT_FRAME_COUNT_MAX}-frame safety limit"
+                "source exceeds the {OUTPUT_FRAME_COUNT_MAX}-frame safety limit"
             ));
         }
-        if !has_next {
+        let has_candidate = read_frame(&mut decoder_output, &mut frame_candidate)?;
+        if !has_candidate {
+            let source_index_end = candidate_index;
+            scheduler.write_span(
+                &frame_anchor,
+                &frame_anchor,
+                anchor_index,
+                source_index_end,
+                false,
+            )?;
             break;
         }
-        std::mem::swap(&mut frame_before, &mut frame_after);
-        source_index = source_index
+
+        let difference = if anime_mode || scene_detection {
+            measure_frame_difference_rgb24(
+                &frame_anchor,
+                &frame_candidate,
+                metadata.width,
+                metadata.height,
+            )
+        } else {
+            FrameDifference::default()
+        };
+        let confident_duplicate = anime_mode && is_confident_duplicate(difference);
+
+        if preserving_long_hold {
+            if confident_duplicate {
+                scheduler.cadence_diagnostics.duplicate_frame_count = scheduler
+                    .cadence_diagnostics
+                    .duplicate_frame_count
+                    .saturating_add(1);
+                scheduler.write_span(
+                    &frame_anchor,
+                    &frame_candidate,
+                    anchor_index,
+                    candidate_index,
+                    false,
+                )?;
+                std::mem::swap(&mut frame_anchor, &mut frame_candidate);
+                anchor_index = candidate_index;
+                candidate_index = candidate_index
+                    .checked_add(1)
+                    .ok_or_else(|| "source frame index overflowed".to_owned())?;
+                continue;
+            }
+
+            let scene_change = scene_detection && difference.mean >= SCENE_THRESHOLD_DEFAULT;
+            if scene_change {
+                scheduler.cadence_diagnostics.scene_cut_count = scheduler
+                    .cadence_diagnostics
+                    .scene_cut_count
+                    .saturating_add(1);
+            }
+            scheduler.write_span(
+                &frame_anchor,
+                &frame_candidate,
+                anchor_index,
+                candidate_index,
+                !scene_change,
+            )?;
+            std::mem::swap(&mut frame_anchor, &mut frame_candidate);
+            anchor_index = candidate_index;
+            candidate_index = candidate_index
+                .checked_add(1)
+                .ok_or_else(|| "source frame index overflowed".to_owned())?;
+            cadence_run_frame_count = 1;
+            preserving_long_hold = false;
+            continue;
+        }
+
+        if confident_duplicate {
+            scheduler.cadence_diagnostics.duplicate_frame_count = scheduler
+                .cadence_diagnostics
+                .duplicate_frame_count
+                .saturating_add(1);
+            cadence_run_frame_count = cadence_run_frame_count
+                .checked_add(1)
+                .ok_or_else(|| "cadence run length overflowed".to_owned())?;
+            if is_smoothable_cadence_run(cadence_run_frame_count) {
+                candidate_index = candidate_index
+                    .checked_add(1)
+                    .ok_or_else(|| "source frame index overflowed".to_owned())?;
+                continue;
+            }
+
+            scheduler.cadence_diagnostics.long_hold_count = scheduler
+                .cadence_diagnostics
+                .long_hold_count
+                .saturating_add(1);
+            scheduler.write_span(
+                &frame_anchor,
+                &frame_candidate,
+                anchor_index,
+                candidate_index,
+                false,
+            )?;
+            std::mem::swap(&mut frame_anchor, &mut frame_candidate);
+            anchor_index = candidate_index;
+            candidate_index = candidate_index
+                .checked_add(1)
+                .ok_or_else(|| "source frame index overflowed".to_owned())?;
+            cadence_run_frame_count = 1;
+            preserving_long_hold = true;
+            continue;
+        }
+
+        let scene_change = scene_detection && difference.mean >= SCENE_THRESHOLD_DEFAULT;
+        if scene_change {
+            scheduler.cadence_diagnostics.scene_cut_count = scheduler
+                .cadence_diagnostics
+                .scene_cut_count
+                .saturating_add(1);
+        }
+        if anime_mode && is_smoothable_cadence_run(cadence_run_frame_count) && !scene_change {
+            scheduler.cadence_diagnostics.cadence_run_count = scheduler
+                .cadence_diagnostics
+                .cadence_run_count
+                .saturating_add(1);
+        }
+        scheduler.write_span(
+            &frame_anchor,
+            &frame_candidate,
+            anchor_index,
+            candidate_index,
+            !scene_change,
+        )?;
+        std::mem::swap(&mut frame_anchor, &mut frame_candidate);
+        anchor_index = candidate_index;
+        candidate_index = candidate_index
             .checked_add(1)
             .ok_or_else(|| "source frame index overflowed".to_owned())?;
+        cadence_run_frame_count = 1;
     }
 
-    encoder_input
-        .flush()
-        .map_err(|error| format!("failed to flush encoder input: {error}"))?;
+    scheduler.finish()?;
+    let cadence_diagnostics = scheduler.cadence_diagnostics;
+    drop(scheduler);
     drop(encoder_input);
-    send_update(
-        updates,
-        JobUpdate::Progress {
-            frame_count: output_index,
-            frame_count_estimate: output_index,
-            processing_fps: output_index as f64 / started_at.elapsed().as_secs_f64().max(0.001),
-            progress: 1.0,
-        },
+    assert!(
+        candidate_index > 0,
+        "processing must inspect at least one source position"
     );
     assert!(
-        output_index > 0,
-        "processing must produce at least one frame"
+        anchor_index < candidate_index,
+        "source frame indices must remain ordered"
     );
-    assert!(
-        output_index < OUTPUT_FRAME_COUNT_MAX,
-        "output must stay below its safety limit"
-    );
-    Ok(())
+    Ok(cadence_diagnostics)
 }
 
 fn read_frame(reader: &mut ChildStdout, frame: &mut [u8]) -> Result<bool, String> {
@@ -757,20 +1105,32 @@ fn read_frame(reader: &mut ChildStdout, frame: &mut [u8]) -> Result<bool, String
     Ok(true)
 }
 
-fn scene_difference_rgb24(frame_before: &[u8], frame_after: &[u8], width: u32, height: u32) -> f32 {
+fn measure_frame_difference_rgb24(
+    frame_before: &[u8],
+    frame_after: &[u8],
+    width: u32,
+    height: u32,
+) -> FrameDifference {
     assert_eq!(
         frame_before.len(),
         frame_after.len(),
-        "scene frames must have equal size"
+        "difference frames must have equal size"
     );
-    assert!(width > 0 && height > 0, "scene dimensions must be positive");
+    assert!(
+        width > 0 && height > 0,
+        "difference dimensions must be positive"
+    );
     let width = width as usize;
     let height = height as usize;
     let row_stride = width * RGB_CHANNEL_COUNT;
     let mut difference_sum = 0_u64;
+    let mut changed_pixel_count = 0_u64;
     let mut sample_count = 0_u64;
-    for y in (0..height).step_by(SCENE_SAMPLE_STEP) {
-        for x in (0..width).step_by(SCENE_SAMPLE_STEP) {
+    let mut tile_difference_sums = [0_u64; DIFFERENCE_TILE_COUNT];
+    let mut tile_sample_counts = [0_u64; DIFFERENCE_TILE_COUNT];
+
+    for y in (0..height).step_by(FRAME_SAMPLE_STEP) {
+        for x in (0..width).step_by(FRAME_SAMPLE_STEP) {
             let index = y * row_stride + x * RGB_CHANNEL_COUNT;
             let before_luma = 54_u32 * u32::from(frame_before[index])
                 + 183_u32 * u32::from(frame_before[index + 1])
@@ -778,21 +1138,93 @@ fn scene_difference_rgb24(frame_before: &[u8], frame_after: &[u8], width: u32, h
             let after_luma = 54_u32 * u32::from(frame_after[index])
                 + 183_u32 * u32::from(frame_after[index + 1])
                 + 19_u32 * u32::from(frame_after[index + 2]);
-            difference_sum += u64::from(before_luma.abs_diff(after_luma));
+            let difference = before_luma.abs_diff(after_luma);
+            difference_sum += u64::from(difference);
+            if difference >= DUPLICATE_PIXEL_DIFFERENCE_MIN {
+                changed_pixel_count += 1;
+            }
+            let tile_x =
+                (x * DIFFERENCE_TILE_COLUMN_COUNT / width).min(DIFFERENCE_TILE_COLUMN_COUNT - 1);
+            let tile_y =
+                (y * DIFFERENCE_TILE_ROW_COUNT / height).min(DIFFERENCE_TILE_ROW_COUNT - 1);
+            let tile_index = tile_y * DIFFERENCE_TILE_COLUMN_COUNT + tile_x;
+            tile_difference_sums[tile_index] += u64::from(difference);
+            tile_sample_counts[tile_index] += 1;
             sample_count += 1;
         }
     }
-    let maximum_difference = sample_count * 255 * 256;
-    let difference = difference_sum as f64 / maximum_difference.max(1) as f64;
+
+    let difference_max = 255_u64 * 256_u64;
+    let mean = difference_sum as f64 / (sample_count.max(1) * difference_max) as f64;
+    let changed_pixel_ratio = changed_pixel_count as f64 / sample_count.max(1) as f64;
+    let mut tile_mean_max = 0.0_f64;
+    for tile_index in 0..DIFFERENCE_TILE_COUNT {
+        let tile_sample_count = tile_sample_counts[tile_index];
+        if tile_sample_count > 0 {
+            let tile_mean = tile_difference_sums[tile_index] as f64
+                / (tile_sample_count * difference_max) as f64;
+            tile_mean_max = tile_mean_max.max(tile_mean);
+        }
+    }
+    let difference = FrameDifference {
+        mean,
+        changed_pixel_ratio,
+        tile_mean_max,
+    };
     assert!(
         sample_count > 0,
-        "scene detector must sample at least one pixel"
+        "difference detector must sample at least one pixel"
     );
     assert!(
-        (0.0..=1.0).contains(&difference),
-        "normalized scene difference must be bounded"
+        (0.0..=1.0).contains(&difference.mean),
+        "mean difference must be normalized"
     );
-    difference as f32
+    difference
+}
+
+fn is_smoothable_cadence_run(cadence_run_frame_count: u64) -> bool {
+    assert!(
+        cadence_run_frame_count > 0,
+        "cadence run must contain at least one frame"
+    );
+    assert!(
+        cadence_run_frame_count < OUTPUT_FRAME_COUNT_MAX,
+        "cadence run must remain bounded"
+    );
+    let smoothable = (CADENCE_RUN_FRAME_COUNT_MIN..=CADENCE_RUN_FRAME_COUNT_MAX)
+        .contains(&cadence_run_frame_count);
+    assert!(
+        !smoothable || cadence_run_frame_count >= CADENCE_RUN_FRAME_COUNT_MIN,
+        "smoothable cadence must contain a held drawing"
+    );
+    assert!(
+        !smoothable || cadence_run_frame_count <= CADENCE_RUN_FRAME_COUNT_MAX,
+        "smoothable cadence must satisfy its upper limit"
+    );
+    smoothable
+}
+
+fn is_confident_duplicate(difference: FrameDifference) -> bool {
+    assert!(
+        (0.0..=1.0).contains(&difference.mean),
+        "mean difference must be normalized"
+    );
+    assert!(
+        (0.0..=1.0).contains(&difference.changed_pixel_ratio),
+        "changed-pixel ratio must be normalized"
+    );
+    let duplicate = difference.mean <= DUPLICATE_MEAN_DIFFERENCE_MAX
+        && difference.changed_pixel_ratio <= DUPLICATE_CHANGED_PIXEL_RATIO_MAX
+        && difference.tile_mean_max <= DUPLICATE_TILE_DIFFERENCE_MAX;
+    assert!(
+        !duplicate || difference.tile_mean_max <= DUPLICATE_TILE_DIFFERENCE_MAX,
+        "duplicate tiles must satisfy their limit"
+    );
+    assert!(
+        !duplicate || difference.mean <= DUPLICATE_MEAN_DIFFERENCE_MAX,
+        "duplicate mean must satisfy its limit"
+    );
+    duplicate
 }
 
 fn parse_rational(text: &str) -> Result<(u64, u64), String> {
@@ -948,9 +1380,36 @@ mod tests {
     fn scene_difference_detects_a_hard_cut() {
         let black = vec![0_u8; 12 * 12 * RGB_CHANNEL_COUNT];
         let white = vec![255_u8; 12 * 12 * RGB_CHANNEL_COUNT];
-        let difference = scene_difference_rgb24(&black, &white, 12, 12);
-        assert!(difference > 0.99);
-        assert!(difference <= 1.0);
+        let difference = measure_frame_difference_rgb24(&black, &white, 12, 12);
+        assert!(difference.mean > 0.99);
+        assert!(difference.mean <= 1.0);
+    }
+
+    #[test]
+    fn confident_duplicate_accepts_uniform_decode_noise() {
+        let frame_before = vec![64_u8; 64 * 64 * RGB_CHANNEL_COUNT];
+        let frame_after = vec![65_u8; 64 * 64 * RGB_CHANNEL_COUNT];
+        let difference = measure_frame_difference_rgb24(&frame_before, &frame_after, 64, 64);
+        assert!(is_confident_duplicate(difference));
+        assert!(difference.mean > 0.0);
+    }
+
+    #[test]
+    fn confident_duplicate_rejects_localized_motion() {
+        let frame_before = vec![0_u8; 64 * 64 * RGB_CHANNEL_COUNT];
+        let mut frame_after = frame_before.clone();
+        frame_after[..RGB_CHANNEL_COUNT].fill(255);
+        let difference = measure_frame_difference_rgb24(&frame_before, &frame_after, 64, 64);
+        assert!(!is_confident_duplicate(difference));
+        assert!(difference.tile_mean_max > DUPLICATE_TILE_DIFFERENCE_MAX);
+    }
+
+    #[test]
+    fn cadence_smoothing_accepts_only_two_or_three_frame_runs() {
+        assert!(!is_smoothable_cadence_run(1));
+        assert!(is_smoothable_cadence_run(2));
+        assert!(is_smoothable_cadence_run(3));
+        assert!(!is_smoothable_cadence_run(4));
     }
 
     #[test]
@@ -961,7 +1420,101 @@ mod tests {
     }
 
     #[test]
-    fn complete_pipeline_interpolates_a_tiny_video() {
+    fn rational_parser_rejects_malformed_rates() {
+        assert!(parse_rational("24").is_err());
+        assert!(parse_rational("24/0").is_err());
+        assert!(parse_rational("nope/1").is_err());
+        assert!(parse_rational("1/nope").is_err());
+    }
+
+    #[test]
+    fn duplicate_confidence_requires_every_metric() {
+        let accepted = FrameDifference {
+            mean: DUPLICATE_MEAN_DIFFERENCE_MAX,
+            changed_pixel_ratio: DUPLICATE_CHANGED_PIXEL_RATIO_MAX,
+            tile_mean_max: DUPLICATE_TILE_DIFFERENCE_MAX,
+        };
+        assert!(is_confident_duplicate(accepted));
+        assert!(!is_confident_duplicate(FrameDifference {
+            mean: DUPLICATE_MEAN_DIFFERENCE_MAX + f64::EPSILON,
+            ..accepted
+        }));
+        assert!(!is_confident_duplicate(FrameDifference {
+            changed_pixel_ratio: DUPLICATE_CHANGED_PIXEL_RATIO_MAX + f64::EPSILON,
+            ..accepted
+        }));
+        assert!(!is_confident_duplicate(FrameDifference {
+            tile_mean_max: DUPLICATE_TILE_DIFFERENCE_MAX + f64::EPSILON,
+            ..accepted
+        }));
+    }
+
+    #[test]
+    fn frame_size_and_partial_path_limits_are_enforced() {
+        assert_eq!(checked_frame_size(64, 64), Ok(64 * 64 * RGB_CHANNEL_COUNT));
+        assert!(checked_frame_size(FRAME_DIMENSION_MAX, FRAME_DIMENSION_MAX).is_err());
+        let output_path = Path::new("/tmp/example.output.mkv");
+        let partial_path = partial_output_path(output_path).expect("partial path should be valid");
+        assert_eq!(partial_path, Path::new("/tmp/example.output.partial.mkv"));
+        assert_eq!(partial_path.extension(), output_path.extension());
+    }
+
+    #[test]
+    fn target_rate_must_exceed_source_rate() {
+        let metadata = VideoMetadata {
+            width: 64,
+            height: 64,
+            source_fps_num: 24_000,
+            source_fps_den: 1_001,
+            duration_seconds: 1.0,
+            pixel_format: "yuv420p".to_owned(),
+        };
+        let mut configuration = JobConfiguration {
+            input_path: PathBuf::from("/tmp/input.mkv"),
+            output_path: PathBuf::from("/tmp/output.mkv"),
+            target_fps_num: 24,
+            target_fps_den: 1,
+            gpu_index: 0,
+            content_preset: ContentPreset::Movie,
+            scene_detection: true,
+            use_uhd_mode: false,
+        };
+        assert!(validate_target_fps(&configuration, &metadata).is_ok());
+        configuration.target_fps_num = 23;
+        assert!(validate_target_fps(&configuration, &metadata).is_err());
+        configuration.target_fps_num = 48;
+        assert!(validate_target_fps(&configuration, &metadata).is_ok());
+    }
+
+    #[test]
+    fn configuration_rejects_colliding_and_existing_outputs() {
+        let process_id = std::process::id();
+        let input_path = PathBuf::from(format!("/tmp/interpolate-config-input-{process_id}.mkv"));
+        let output_path = PathBuf::from(format!("/tmp/interpolate-config-output-{process_id}.mkv"));
+        fs::write(&input_path, b"input").expect("test input should be created");
+        let _ = fs::remove_file(&output_path);
+        let mut configuration = JobConfiguration {
+            input_path: input_path.clone(),
+            output_path: output_path.clone(),
+            target_fps_num: 60,
+            target_fps_den: 1,
+            gpu_index: 0,
+            content_preset: ContentPreset::Movie,
+            scene_detection: true,
+            use_uhd_mode: false,
+        };
+        assert!(validate_configuration(&configuration).is_ok());
+        configuration.output_path = input_path.clone();
+        assert!(validate_configuration(&configuration).is_err());
+        configuration.output_path = output_path.clone();
+        fs::write(&output_path, b"output").expect("test output should be created");
+        assert!(validate_configuration(&configuration).is_err());
+        fs::remove_file(input_path).expect("test input should be removed");
+        fs::remove_file(output_path).expect("test output should be removed");
+    }
+
+    #[test]
+    fn complete_pipeline_smooths_a_tiny_anime_cadence() {
         let process_id = std::process::id();
         assert!(process_id > 0, "test process ID must be positive");
         assert!(
@@ -981,7 +1534,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=size=64x64:rate=4:duration=1",
+                "color=c=black:size=64x64:rate=4:duration=1,drawbox=color=0x202020:t=fill:enable=gte(n\\,3)",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:v",
@@ -1001,9 +1554,43 @@ mod tests {
             target_fps_num: 8,
             target_fps_den: 1,
             gpu_index: 0,
+            content_preset: ContentPreset::Anime,
             scene_detection: true,
             use_uhd_mode: false,
         };
+        let cancelled_output_path =
+            PathBuf::from(format!("/tmp/interpolate-cancelled-{process_id}.mkv"));
+        let _ = fs::remove_file(&cancelled_output_path);
+        let mut cancelled_configuration = configuration.clone();
+        cancelled_configuration.output_path = cancelled_output_path.clone();
+        let cancelled_before_start = Arc::new(AtomicBool::new(true));
+        let (cancelled_sender, cancelled_receiver) = std::sync::mpsc::sync_channel(4);
+        run_job(
+            cancelled_configuration,
+            cancelled_before_start,
+            cancelled_sender,
+        );
+        let mut cancellation_reported = false;
+        for _ in 0..4 {
+            match cancelled_receiver.try_recv() {
+                Ok(JobUpdate::Cancelled) => {
+                    cancellation_reported = true;
+                    break;
+                }
+                Ok(JobUpdate::Phase(_)) => {}
+                Ok(update) => panic!("unexpected cancellation update: {update:?}"),
+                Err(error) => panic!("cancelled pipeline update missing: {error}"),
+            }
+        }
+        assert!(
+            cancellation_reported,
+            "pre-start cancellation must be reported"
+        );
+        assert!(
+            !cancelled_output_path.exists(),
+            "cancelled output must not be published"
+        );
+
         let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_cancelled = Arc::clone(&cancelled);
@@ -1011,10 +1598,21 @@ mod tests {
         let mut completed = false;
         for _ in 0..100 {
             match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(JobUpdate::Completed(path)) => {
+                Ok(JobUpdate::Completed {
+                    path,
+                    cadence_diagnostics,
+                }) => {
                     assert_eq!(
                         path, output_path,
                         "completion path must match requested output"
+                    );
+                    assert_eq!(
+                        cadence_diagnostics.duplicate_frame_count, 2,
+                        "Anime mode must detect the two repeated held drawings"
+                    );
+                    assert_eq!(
+                        cadence_diagnostics.cadence_run_count, 1,
+                        "Anime mode must smooth the three-frame cadence run"
                     );
                     completed = true;
                     break;
@@ -1036,6 +1634,19 @@ mod tests {
         assert!(
             output_path.is_file(),
             "pipeline must produce an output file"
+        );
+        let output_metadata = probe_video(&output_path).expect("output should be probeable");
+        assert_eq!(
+            (
+                output_metadata.source_fps_num,
+                output_metadata.source_fps_den
+            ),
+            (8, 1),
+            "output frame rate must match the request"
+        );
+        assert!(
+            (0.9..=1.1).contains(&output_metadata.duration_seconds),
+            "output duration must preserve the one-second source timeline"
         );
         let _ = fs::remove_file(input_path);
         let _ = fs::remove_file(output_path);

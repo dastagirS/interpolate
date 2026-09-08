@@ -7,7 +7,8 @@ use gpui::{
     Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, size,
 };
 use pipeline::{
-    JobConfiguration, JobUpdate, VideoMetadata, default_output_path, probe_video, run_job,
+    CadenceDiagnostics, ContentPreset, JobConfiguration, JobUpdate, VideoMetadata,
+    default_output_path, probe_video, run_job,
 };
 use std::{
     path::{Path, PathBuf},
@@ -45,6 +46,27 @@ const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
 const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
 
+fn use_uhd_mode_default(content_preset: ContentPreset, metadata: Option<&VideoMetadata>) -> bool {
+    assert!(UHD_WIDTH_MIN > 0, "UHD width threshold must be positive");
+    assert!(UHD_HEIGHT_MIN > 0, "UHD height threshold must be positive");
+    let use_uhd_mode = content_preset == ContentPreset::Anime
+        && metadata.is_some_and(|metadata| {
+            let landscape_uhd =
+                metadata.width >= UHD_WIDTH_MIN && metadata.height >= UHD_HEIGHT_MIN;
+            let portrait_uhd = metadata.width >= UHD_HEIGHT_MIN && metadata.height >= UHD_WIDTH_MIN;
+            landscape_uhd || portrait_uhd
+        });
+    assert!(
+        !use_uhd_mode || content_preset == ContentPreset::Anime,
+        "automatic UHD mode is reserved for Anime"
+    );
+    assert!(
+        !use_uhd_mode || metadata.is_some(),
+        "automatic UHD mode requires source metadata"
+    );
+    use_uhd_mode
+}
+
 fn format_remaining_time(remaining_seconds: u64) -> String {
     assert!(
         SECONDS_PER_MINUTE > 0,
@@ -73,6 +95,9 @@ fn format_remaining_time(remaining_seconds: u64) -> String {
     formatted
 }
 
+const UHD_WIDTH_MIN: u32 = 3_840;
+const UHD_HEIGHT_MIN: u32 = 2_160;
+
 struct InterpolateApp {
     input_path: Option<PathBuf>,
     output_path: Option<PathBuf>,
@@ -80,12 +105,17 @@ struct InterpolateApp {
     gpu_names: Vec<String>,
     selected_gpu_index: usize,
     gpu_menu_open: bool,
+    preset_menu_open: bool,
     target_fps_num: u32,
     target_fps_input: String,
     target_fps_replace_on_type: bool,
     target_fps_focus: FocusHandle,
+    content_preset: ContentPreset,
     scene_detection: bool,
+    scene_detection_overridden: bool,
     use_uhd_mode: bool,
+    use_uhd_mode_overridden: bool,
+    cadence_diagnostics: CadenceDiagnostics,
     running: bool,
     status: String,
     error: Option<String>,
@@ -125,12 +155,17 @@ impl InterpolateApp {
             gpu_names,
             selected_gpu_index: 0,
             gpu_menu_open: false,
+            preset_menu_open: false,
             target_fps_num: 120,
             target_fps_input: "120".to_owned(),
             target_fps_replace_on_type: false,
             target_fps_focus: cx.focus_handle(),
+            content_preset: ContentPreset::Movie,
             scene_detection: true,
+            scene_detection_overridden: false,
             use_uhd_mode: false,
+            use_uhd_mode_overridden: false,
+            cadence_diagnostics: CadenceDiagnostics::default(),
             running: false,
             status: "Ready to interpolate".to_owned(),
             error,
@@ -181,12 +216,19 @@ impl InterpolateApp {
                             ));
                             app.input_path = Some(path);
                             app.metadata = Some(metadata);
+                            if !app.use_uhd_mode_overridden {
+                                app.use_uhd_mode =
+                                    use_uhd_mode_default(app.content_preset, app.metadata.as_ref());
+                            }
                             app.error = None;
                             app.status = "Video ready".to_owned();
                         }
                         Err(error) => {
                             app.input_path = Some(path);
                             app.metadata = None;
+                            if !app.use_uhd_mode_overridden {
+                                app.use_uhd_mode = false;
+                            }
                             app.error = Some(error);
                             app.status = "Input needs attention".to_owned();
                         }
@@ -337,6 +379,7 @@ impl InterpolateApp {
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
         if !self.running && !self.gpu_names.is_empty() {
             self.gpu_menu_open = !self.gpu_menu_open;
+            self.preset_menu_open = false;
             cx.notify();
         }
         assert!(
@@ -370,6 +413,54 @@ impl InterpolateApp {
         );
     }
 
+    fn toggle_preset_menu(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must be positive");
+        assert!(self.target_fps_num <= 480, "target FPS must stay bounded");
+        if !self.running {
+            self.preset_menu_open = !self.preset_menu_open;
+            self.gpu_menu_open = false;
+            cx.notify();
+        }
+        assert!(
+            !self.preset_menu_open || !self.running,
+            "running state cannot retain an open preset menu"
+        );
+        assert!(
+            !self.preset_menu_open || !self.gpu_menu_open,
+            "only one settings menu may be open"
+        );
+    }
+
+    fn select_content_preset(&mut self, preset: ContentPreset, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must be positive");
+        assert!(
+            self.selected_gpu_index <= self.gpu_names.len(),
+            "GPU selection must be bounded"
+        );
+        if !self.running {
+            self.content_preset = preset;
+            self.scene_detection = true;
+            self.scene_detection_overridden = false;
+            self.use_uhd_mode = use_uhd_mode_default(preset, self.metadata.as_ref());
+            self.use_uhd_mode_overridden = false;
+            self.preset_menu_open = false;
+            self.refresh_default_output();
+            cx.notify();
+        }
+        assert!(
+            self.running || self.content_preset == preset,
+            "idle preset selection must be applied"
+        );
+        assert!(
+            !self.preset_menu_open || !self.running,
+            "running state cannot retain an open preset menu"
+        );
+        assert!(
+            self.content_preset != ContentPreset::Anime || self.scene_detection,
+            "Anime preset must retain scene protection"
+        );
+    }
+
     fn toggle_scene_detection(
         &mut self,
         _: &gpui::ClickEvent,
@@ -383,8 +474,9 @@ impl InterpolateApp {
                 .is_none_or(|path| !path.as_os_str().is_empty()),
             "output path must be valid"
         );
-        if !self.running {
+        if !self.running && self.content_preset == ContentPreset::Movie {
             self.scene_detection = !self.scene_detection;
+            self.scene_detection_overridden = !self.scene_detection;
             self.refresh_default_output();
             cx.notify();
         }
@@ -403,6 +495,8 @@ impl InterpolateApp {
         );
         if !self.running {
             self.use_uhd_mode = !self.use_uhd_mode;
+            self.use_uhd_mode_overridden = self.use_uhd_mode
+                != use_uhd_mode_default(self.content_preset, self.metadata.as_ref());
             cx.notify();
         }
         assert!(
@@ -481,6 +575,7 @@ impl InterpolateApp {
             target_fps_num: self.target_fps_num,
             target_fps_den: 1,
             gpu_index,
+            content_preset: self.content_preset,
             scene_detection: self.scene_detection,
             use_uhd_mode: self.use_uhd_mode,
         };
@@ -498,12 +593,14 @@ impl InterpolateApp {
 
         self.running = true;
         self.gpu_menu_open = false;
+        self.preset_menu_open = false;
         self.status = "Starting job".to_owned();
         self.error = None;
         self.progress = 0.0;
         self.frame_count = 0;
         self.frame_count_estimate = 0;
         self.processing_fps = 0.0;
+        self.cadence_diagnostics = CadenceDiagnostics::default();
         self.cancellation = Some(cancellation);
         cx.notify();
 
@@ -516,7 +613,7 @@ impl InterpolateApp {
                         Ok(update) => {
                             terminal = matches!(
                                 update,
-                                JobUpdate::Completed(_)
+                                JobUpdate::Completed { .. }
                                     | JobUpdate::Cancelled
                                     | JobUpdate::Failed(_)
                             );
@@ -579,16 +676,22 @@ impl InterpolateApp {
                 frame_count_estimate,
                 processing_fps,
                 progress,
+                cadence_diagnostics,
             } => {
                 self.frame_count = frame_count;
                 self.frame_count_estimate = frame_count_estimate;
                 self.processing_fps = processing_fps;
                 self.progress = progress.clamp(0.0, 1.0);
+                self.cadence_diagnostics = cadence_diagnostics;
             }
-            JobUpdate::Completed(path) => {
+            JobUpdate::Completed {
+                path,
+                cadence_diagnostics,
+            } => {
                 self.running = false;
                 self.cancellation = None;
                 self.progress = 1.0;
+                self.cadence_diagnostics = cadence_diagnostics;
                 self.status = format!("Completed · {}", path.display());
             }
             JobUpdate::Cancelled => {
@@ -697,6 +800,18 @@ impl Render for InterpolateApp {
             .parse::<u32>()
             .is_ok_and(|target_fps_num| (1..=480).contains(&target_fps_num));
         let target_fps_focused = self.target_fps_focus.is_focused(window);
+        let anime_preset_selected = self.content_preset == ContentPreset::Anime;
+        let preset_modified = self.scene_detection_overridden || self.use_uhd_mode_overridden;
+        let preset_name = if anime_preset_selected {
+            "Anime"
+        } else {
+            "Movie"
+        };
+        let preset_label = if preset_modified {
+            format!("{preset_name} · Modified")
+        } else {
+            preset_name.to_owned()
+        };
         let gpu_menu_height = px((self.gpu_names.len().clamp(1, 4) * 36) as f32);
         let can_start = !self.running
             && self.input_path.is_some()
@@ -908,6 +1023,62 @@ impl Render for InterpolateApp {
                                                     .items_center()
                                                     .justify_between()
                                                     .child(
+                                                        div().child("Content preset").child(
+                                                            div()
+                                                                .mt_1()
+                                                                .text_xs()
+                                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                .child("Profile tuning follows clip tests"),
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("preset-selector")
+                                                            .w(px(270.0))
+                                                            .px_3()
+                                                            .py_2()
+                                                            .rounded_md()
+                                                            .cursor_pointer()
+                                                            .border_1()
+                                                            .border_color(rgb(if self.preset_menu_open {
+                                                                ACCENT_COLOR
+                                                            } else {
+                                                                BORDER_COLOR
+                                                            }))
+                                                            .bg(rgb(PANEL_COLOR))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .font_family("JetBrains Mono")
+                                                            .text_xs()
+                                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                                            .hover(|style| {
+                                                                style.border_color(rgb(BORDER_STRONG_COLOR))
+                                                            })
+                                                            .on_click(cx.listener(Self::toggle_preset_menu))
+                                                            .child(preset_label.clone())
+                                                            .child(
+                                                                div()
+                                                                    .ml_2()
+                                                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                                                    .child(if self.preset_menu_open {
+                                                                        "⌃"
+                                                                    } else {
+                                                                        "⌄"
+                                                                    }),
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(64.0))
+                                                    .px_4()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .border_t_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(
                                                         div().child("Target frame rate").child(
                                                             div()
                                                                 .mt_1()
@@ -1021,7 +1192,11 @@ impl Render for InterpolateApp {
                                                                 .mt_1()
                                                                 .text_xs()
                                                                 .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child("Duplicate at hard cuts"),
+                                                                .child(if anime_preset_selected {
+                                                                    "Required for cadence safety"
+                                                                } else {
+                                                                    "Duplicate at hard cuts"
+                                                                }),
                                                         ),
                                                     )
                                                     .child(
@@ -1035,13 +1210,18 @@ impl Render for InterpolateApp {
                                                             .when(!self.scene_detection, |element| element.justify_start())
                                                             .items_center()
                                                             .rounded_full()
-                                                            .cursor_pointer()
                                                             .bg(rgb(if self.scene_detection {
                                                                 ACCENT_COLOR
                                                             } else {
                                                                 BORDER_STRONG_COLOR
                                                             }))
-                                                            .on_click(cx.listener(Self::toggle_scene_detection))
+                                                            .when(!anime_preset_selected, |element| {
+                                                                element
+                                                                    .cursor_pointer()
+                                                                    .on_click(cx.listener(
+                                                                        Self::toggle_scene_detection,
+                                                                    ))
+                                                            })
                                                             .child(div().size(px(16.0)).rounded_full().bg(rgb(TEXT_COLOR))),
                                                     ),
                                             )
@@ -1060,7 +1240,11 @@ impl Render for InterpolateApp {
                                                                 .mt_1()
                                                                 .text_xs()
                                                                 .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child("Reduce memory for 4K sources"),
+                                                                .child(if anime_preset_selected {
+                                                                    "Automatic for 4K; click to override"
+                                                                } else {
+                                                                    "Reduce memory for 4K sources"
+                                                                }),
                                                         ),
                                                     )
                                                     .child(
@@ -1084,12 +1268,79 @@ impl Render for InterpolateApp {
                                                             .child(div().size(px(16.0)).rounded_full().bg(rgb(TEXT_COLOR))),
                                                     ),
                                             )
+                                            .when(self.preset_menu_open, |element| {
+                                                element.child(
+                                                    div()
+                                                        .id("preset-options")
+                                                        .absolute()
+                                                        .top(px(52.0))
+                                                        .right(px(16.0))
+                                                        .w(px(270.0))
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(rgb(BORDER_STRONG_COLOR))
+                                                        .bg(rgb(PANEL_COLOR))
+                                                        .shadow_lg()
+                                                        .children(
+                                                            [
+                                                                (ContentPreset::Movie, "Movie"),
+                                                                (ContentPreset::Anime, "Anime"),
+                                                            ]
+                                                            .into_iter()
+                                                            .enumerate()
+                                                            .map(|(preset_index, (preset, label))| {
+                                                                let selected = preset == self.content_preset;
+                                                                div()
+                                                                    .id(("preset-option", preset_index))
+                                                                    .h(px(36.0))
+                                                                    .px_3()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .cursor_pointer()
+                                                                    .border_b_1()
+                                                                    .border_color(rgb(BORDER_COLOR))
+                                                                    .bg(rgb(if selected {
+                                                                        SELECTED_COLOR
+                                                                    } else {
+                                                                        PANEL_COLOR
+                                                                    }))
+                                                                    .hover(|style| {
+                                                                        style.bg(rgb(PANEL_HOVER_COLOR))
+                                                                    })
+                                                                    .on_click(cx.listener(
+                                                                        move |app, _, _, cx| {
+                                                                            app.select_content_preset(
+                                                                                preset, cx,
+                                                                            )
+                                                                        },
+                                                                    ))
+                                                                    .child(
+                                                                        div()
+                                                                            .font_family(
+                                                                                "JetBrains Mono",
+                                                                            )
+                                                                            .text_xs()
+                                                                            .text_color(rgb(
+                                                                                if selected {
+                                                                                    TEXT_COLOR
+                                                                                } else {
+                                                                                    TEXT_MUTED_COLOR
+                                                                                },
+                                                                            ))
+                                                                            .child(label),
+                                                                    )
+                                                                    .child(if selected { "✓" } else { "" })
+                                                            }),
+                                                        ),
+                                                )
+                                            })
                                             .when(self.gpu_menu_open, |element| {
                                                 element.child(
                                                     div()
                                                         .id("gpu-options")
                                                         .absolute()
-                                                        .top(px(116.0))
+                                                        .top(px(180.0))
                                                         .right(px(16.0))
                                                         .w(px(270.0))
                                                         .h(gpu_menu_height)
@@ -1179,7 +1430,11 @@ impl Render for InterpolateApp {
                                                     .mt_1()
                                                     .text_xs()
                                                     .text_color(rgb(TEXT_MUTED_COLOR))
-                                                    .child("RIFE 4.25 standard"),
+                                                    .child(if anime_preset_selected {
+                                                        "RIFE 4.25 · cadence protected"
+                                                    } else {
+                                                        "RIFE 4.25 standard"
+                                                    }),
                                             )
                                             .child(
                                                 div()
@@ -1297,11 +1552,21 @@ impl Render for InterpolateApp {
                                                     .border_color(rgb(BORDER_COLOR))
                                                     .text_xs()
                                                     .text_color(rgb(TEXT_SUBTLE_COLOR))
-                                                    .child(if self.scene_detection {
+                                                    .child(format!("{preset_label} content preset"))
+                                                    .when(anime_preset_selected, |element| {
+                                                        element.child(div().mt_1().child(format!(
+                                                            "{} held frames · {} smoothed runs",
+                                                            self.cadence_diagnostics
+                                                                .duplicate_frame_count,
+                                                            self.cadence_diagnostics
+                                                                .cadence_run_count
+                                                        )))
+                                                    })
+                                                    .child(div().mt_1().child(if self.scene_detection {
                                                         "Scene cuts protected"
                                                     } else {
                                                         "Scene protection disabled"
-                                                    })
+                                                    }))
                                                     .child(div().mt_1().child(
                                                         if self.use_uhd_mode {
                                                             "Half-scale optical flow"
@@ -1481,23 +1746,6 @@ impl Drop for InterpolateApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_remaining_time;
-
-    #[test]
-    fn remaining_time_uses_hours_for_long_jobs() {
-        assert_eq!(format_remaining_time(11_558), "3:12:38 remaining");
-        assert_eq!(format_remaining_time(18_758), "5:12:38 remaining");
-    }
-
-    #[test]
-    fn remaining_time_keeps_minutes_for_short_jobs() {
-        assert_eq!(format_remaining_time(758), "12:38 remaining");
-        assert_eq!(format_remaining_time(59), "0:59 remaining");
-    }
-}
-
 fn main() {
     assert!(WINDOW_WIDTH_PIXELS > 0.0, "window width must be positive");
     assert!(WINDOW_HEIGHT_PIXELS > 0.0, "window height must be positive");
@@ -1526,4 +1774,60 @@ fn main() {
         WINDOW_HEIGHT_PIXELS.is_finite(),
         "window height must remain finite"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentPreset, VideoMetadata, format_remaining_time, use_uhd_mode_default};
+
+    #[test]
+    fn anime_enables_uhd_for_4k_sources() {
+        let metadata = VideoMetadata {
+            width: 3_840,
+            height: 2_160,
+            source_fps_num: 24,
+            source_fps_den: 1,
+            duration_seconds: 1.0,
+            pixel_format: "yuv420p".to_owned(),
+        };
+        assert!(use_uhd_mode_default(ContentPreset::Anime, Some(&metadata)));
+        assert!(!use_uhd_mode_default(ContentPreset::Movie, Some(&metadata)));
+        let portrait_metadata = VideoMetadata {
+            width: metadata.height,
+            height: metadata.width,
+            ..metadata
+        };
+        assert!(use_uhd_mode_default(
+            ContentPreset::Anime,
+            Some(&portrait_metadata)
+        ));
+    }
+
+    #[test]
+    fn anime_keeps_full_scale_flow_below_4k() {
+        let mut metadata = VideoMetadata {
+            width: 1_920,
+            height: 1_080,
+            source_fps_num: 24,
+            source_fps_den: 1,
+            duration_seconds: 1.0,
+            pixel_format: "yuv420p".to_owned(),
+        };
+        assert!(!use_uhd_mode_default(ContentPreset::Anime, Some(&metadata)));
+        metadata.width = 3_840;
+        assert!(!use_uhd_mode_default(ContentPreset::Anime, Some(&metadata)));
+        assert!(!use_uhd_mode_default(ContentPreset::Anime, None));
+    }
+
+    #[test]
+    fn remaining_time_uses_hours_for_long_jobs() {
+        assert_eq!(format_remaining_time(11_558), "3:12:38 remaining");
+        assert_eq!(format_remaining_time(18_758), "5:12:38 remaining");
+    }
+
+    #[test]
+    fn remaining_time_keeps_minutes_for_short_jobs() {
+        assert_eq!(format_remaining_time(758), "12:38 remaining");
+        assert_eq!(format_remaining_time(59), "0:59 remaining");
+    }
 }

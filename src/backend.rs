@@ -380,6 +380,35 @@ mod tests {
         let frame_before = vec![0_u8; FRAME_SIZE];
         let frame_after = vec![255_u8; FRAME_SIZE];
         let mut frame_output = vec![0_u8; FRAME_SIZE];
+        let short_frame = vec![0_u8; FRAME_SIZE - 1];
+        let invalid_size_error = backend
+            .interpolate_rgb24(
+                &short_frame,
+                &frame_after,
+                WIDTH,
+                HEIGHT,
+                0.5,
+                &mut frame_output,
+            )
+            .expect_err("short input must be rejected");
+        assert!(invalid_size_error.contains("exactly"));
+        assert!(frame_output.iter().all(|value| *value == 0));
+
+        for invalid_timestep in [f32::NAN, 0.0, 1.0] {
+            let invalid_timestep_error = backend
+                .interpolate_rgb24(
+                    &frame_before,
+                    &frame_after,
+                    WIDTH,
+                    HEIGHT,
+                    invalid_timestep,
+                    &mut frame_output,
+                )
+                .expect_err("invalid timestep must be rejected");
+            assert!(invalid_timestep_error.contains("strictly between"));
+            assert!(frame_output.iter().all(|value| *value == 0));
+        }
+
         backend
             .interpolate_rgb24(
                 &frame_before,
