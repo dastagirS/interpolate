@@ -72,7 +72,7 @@ fn main() {
         "native CMake build",
     );
 
-    let backend_library = build_directory.join("libinterpolate_backend.so");
+    let backend_library = build_directory.join("libinterpolate_backend.a");
     assert!(
         backend_library.is_file(),
         "native backend library must exist"
@@ -100,9 +100,10 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=interpolate_backend");
     println!("cargo:rustc-link-lib=static=ncnn");
+    println!("cargo:rustc-link-lib=dylib=vulkan");
+    println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=static=SPIRV");
     println!("cargo:rustc-link-lib=static=glslang");
-    println!("cargo:rustc-link-lib=dylib=vulkan");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rerun-if-changed=native/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/interpolate_backend.cpp");
