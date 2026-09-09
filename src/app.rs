@@ -5,11 +5,12 @@ use crate::pipeline::{
 };
 use crate::tray::{TrayCommand, TrayController};
 use gpui::{
-    AnyWindowHandle, App, Application, Bounds, Context, FocusHandle, KeyDownEvent,
-    PathPromptOptions, Render, Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    relative, rgb, size,
+    AnyWindowHandle, App, Application, AssetSource, Bounds, Context, FocusHandle, KeyDownEvent,
+    PathPromptOptions, Render, SharedString, Timer, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, relative, rgb, size, svg,
 };
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -99,6 +100,51 @@ fn format_remaining_time(remaining_seconds: u64) -> String {
 
 const UHD_WIDTH_MIN: u32 = 3_840;
 const UHD_HEIGHT_MIN: u32 = 2_160;
+const HEADER_NAV_BUTTON_SIZE_PIXELS: f32 = 28.0;
+const HEADER_NAV_ICON_SIZE_PIXELS: f32 = 14.0;
+const HEADER_NAV_ICON_PATH_PAUSE: &str = "icons/pause.svg";
+const HEADER_NAV_ICON_PATH_SETTINGS: &str = "icons/settings.svg";
+
+struct BundledAssets;
+
+impl AssetSource for BundledAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        assert!(!path.is_empty(), "asset path must not be empty");
+        assert!(path.len() < 128, "asset path must remain bounded");
+        let bytes = match path {
+            HEADER_NAV_ICON_PATH_PAUSE => Some(&include_bytes!("../assets/icons/pause.svg")[..]),
+            HEADER_NAV_ICON_PATH_SETTINGS => {
+                Some(&include_bytes!("../assets/icons/settings.svg")[..])
+            }
+            _ => None,
+        };
+        Ok(bytes.map(Cow::Borrowed))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        assert!(path.len() < 128, "asset directory path must remain bounded");
+        let icons = if path.is_empty() || path == "icons" || path == "icons/" {
+            vec![
+                SharedString::from(HEADER_NAV_ICON_PATH_PAUSE),
+                SharedString::from(HEADER_NAV_ICON_PATH_SETTINGS),
+            ]
+        } else {
+            Vec::new()
+        };
+        assert!(icons.len() <= 2, "bundled icon listing must remain bounded");
+        Ok(icons)
+    }
+}
+
+fn header_nav_icon(path: &'static str, color: u32) -> gpui::Svg {
+    assert!(!path.is_empty(), "header icon path must not be empty");
+    assert!(path.len() < 128, "header icon path must remain bounded");
+    svg()
+        .path(path)
+        .size(px(HEADER_NAV_ICON_SIZE_PIXELS))
+        .flex_shrink_0()
+        .text_color(rgb(color))
+}
 
 struct InterpolateApp {
     input_path: Option<PathBuf>,
@@ -108,6 +154,7 @@ struct InterpolateApp {
     selected_gpu_index: usize,
     gpu_menu_open: bool,
     preset_menu_open: bool,
+    settings_page: bool,
     target_fps_num: u32,
     target_fps_input: String,
     target_fps_replace_on_type: bool,
@@ -161,6 +208,7 @@ impl InterpolateApp {
             Ok(_) => (Vec::new(), Some("No Vulkan GPU was found".to_owned())),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let tray_available = tray_controller.is_some();
         let app = Self {
             input_path,
             output_path,
@@ -169,6 +217,7 @@ impl InterpolateApp {
             selected_gpu_index: 0,
             gpu_menu_open: false,
             preset_menu_open: false,
+            settings_page: false,
             target_fps_num: 120,
             target_fps_input: "120".to_owned(),
             target_fps_replace_on_type: false,
@@ -190,7 +239,7 @@ impl InterpolateApp {
             worker: None,
             tray_controller,
             tray_unavailable_reason: tray_error,
-            keep_running_background: false,
+            keep_running_background: tray_available,
             quit_after_job: false,
         };
         assert!(
@@ -459,6 +508,35 @@ impl InterpolateApp {
             self.target_fps_num > 0,
             "last valid target FPS must remain positive"
         );
+    }
+
+    fn set_settings_page(&mut self, settings_page: bool, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must remain valid");
+        assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        self.settings_page = settings_page;
+        self.gpu_menu_open = false;
+        self.preset_menu_open = false;
+        cx.notify();
+        assert!(
+            !self.gpu_menu_open,
+            "settings navigation must close GPU menus"
+        );
+        assert!(
+            !self.preset_menu_open,
+            "settings navigation must close preset menus"
+        );
+    }
+
+    fn show_encode_page(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must remain valid");
+        assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        self.set_settings_page(false, cx);
+    }
+
+    fn show_settings_page(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must remain valid");
+        assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        self.set_settings_page(true, cx);
     }
 
     fn toggle_gpu_menu(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1021,7 +1099,66 @@ impl Render for InterpolateApp {
                                     .text_xs()
                                     .child("I"),
                             )
-                            .child("Interpolate"),
+                            .child("Interpolate")
+                            .child(
+                                div()
+                                    .ml_3()
+                                    .flex()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .bg(rgb(PANEL_COLOR))
+                                    .child(
+                                        div()
+                                            .id("encode-page")
+                                            .size(px(HEADER_NAV_BUTTON_SIZE_PIXELS))
+                                            .rounded_md()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .bg(rgb(if !self.settings_page {
+                                                SELECTED_COLOR
+                                            } else {
+                                                PANEL_COLOR
+                                            }))
+                                            .hover(|style| style.bg(rgb(PANEL_HOVER_COLOR)))
+                                            .on_click(cx.listener(Self::show_encode_page))
+                                            .child(header_nav_icon(
+                                                HEADER_NAV_ICON_PATH_PAUSE,
+                                                if !self.settings_page {
+                                                    TEXT_COLOR
+                                                } else {
+                                                    TEXT_MUTED_COLOR
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-page")
+                                            .size(px(HEADER_NAV_BUTTON_SIZE_PIXELS))
+                                            .rounded_md()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .bg(rgb(if self.settings_page {
+                                                SELECTED_COLOR
+                                            } else {
+                                                PANEL_COLOR
+                                            }))
+                                            .hover(|style| style.bg(rgb(PANEL_HOVER_COLOR)))
+                                            .on_click(cx.listener(Self::show_settings_page))
+                                            .child(header_nav_icon(
+                                                HEADER_NAV_ICON_PATH_SETTINGS,
+                                                if self.settings_page {
+                                                    TEXT_COLOR
+                                                } else {
+                                                    TEXT_MUTED_COLOR
+                                                },
+                                            )),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -1144,7 +1281,112 @@ impl Render for InterpolateApp {
                             .child("Source…"),
                     ),
             )
-            .child(
+            .child(if self.settings_page {
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .mb_3()
+                            .text_xs()
+                            .text_color(rgb(TEXT_SUBTLE_COLOR))
+                            .child("SETTINGS"),
+                    )
+                    .child(
+                        div()
+                            .w(px(640.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .bg(rgb(PANEL_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_4()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div()
+                                            .font_family("JetBrains Mono")
+                                            .child("Application behavior"),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .child("Control how Interpolate behaves while a job is running."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(76.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div().child("Keep running in background").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child(if self.tray_controller.is_some() {
+                                                    "Closing the window minimizes the job to the system tray"
+                                                } else {
+                                                    "System tray unavailable on this desktop"
+                                                }),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-background-mode")
+                                            .w(px(36.0))
+                                            .h(px(20.0))
+                                            .p(px(2.0))
+                                            .flex()
+                                            .justify_end()
+                                            .when(!self.keep_running_background, |element| {
+                                                element.justify_start()
+                                            })
+                                            .items_center()
+                                            .rounded_full()
+                                            .when(self.tray_controller.is_some(), |element| {
+                                                element
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        Self::toggle_background_mode,
+                                                    ))
+                                            })
+                                            .bg(rgb(if self.keep_running_background {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_STRONG_COLOR
+                                            }))
+                                            .child(
+                                                div()
+                                                    .size(px(16.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(TEXT_COLOR)),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .child(if self.tray_controller.is_some() {
+                                "Background mode is enabled by default when a compatible system tray is available."
+                            } else {
+                                "Background mode requires a freedesktop StatusNotifierItem system tray."
+                            }),
+                    )
+            } else {
                 div()
                     .flex_1()
                     .overflow_hidden()
@@ -1427,61 +1669,6 @@ impl Render for InterpolateApp {
                                                             }))
                                                             .on_click(cx.listener(Self::toggle_uhd_mode))
                                                             .child(div().size(px(16.0)).rounded_full().bg(rgb(TEXT_COLOR))),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .h(px(64.0))
-                                                    .px_4()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .border_t_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(
-                                                        div().child("Keep running in background").child(
-                                                            div()
-                                                                .mt_1()
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child(if self.tray_controller.is_some() {
-                                                                    "Close to the system tray during a job"
-                                                                } else {
-                                                                    "System tray unavailable"
-                                                                }),
-                                                        ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id("background-mode")
-                                                            .w(px(36.0))
-                                                            .h(px(20.0))
-                                                            .p(px(2.0))
-                                                            .flex()
-                                                            .justify_end()
-                                                            .when(!self.keep_running_background, |element| {
-                                                                element.justify_start()
-                                                            })
-                                                            .items_center()
-                                                            .rounded_full()
-                                                            .when(self.tray_controller.is_some(), |element| {
-                                                                element
-                                                                    .cursor_pointer()
-                                                                    .on_click(cx.listener(
-                                                                        Self::toggle_background_mode,
-                                                                    ))
-                                                            })
-                                                            .bg(rgb(if self.keep_running_background {
-                                                                ACCENT_COLOR
-                                                            } else {
-                                                                BORDER_STRONG_COLOR
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .size(px(16.0))
-                                                                    .rounded_full()
-                                                                    .bg(rgb(TEXT_COLOR)),
-                                                            ),
                                                     ),
                                             )
                                             .when(self.preset_menu_open, |element| {
@@ -1856,8 +2043,8 @@ impl Render for InterpolateApp {
                                             .child("Browse…"),
                                     ),
                             ),
-                    ),
-            )
+                    )
+            })
             .child(
                 div()
                     .h(px(68.0))
@@ -1970,60 +2157,62 @@ impl Drop for InterpolateApp {
 pub fn run() {
     assert!(WINDOW_WIDTH_PIXELS > 0.0, "window width must be positive");
     assert!(WINDOW_HEIGHT_PIXELS > 0.0, "window height must be positive");
-    Application::new().run(|context: &mut App| {
-        let (tray_controller, tray_commands, tray_error) = match TrayController::start() {
-            Ok((tray_controller, tray_commands)) => {
-                (Some(tray_controller), Some(tray_commands), None)
+    Application::new()
+        .with_assets(BundledAssets)
+        .run(|context: &mut App| {
+            let (tray_controller, tray_commands, tray_error) = match TrayController::start() {
+                Ok((tray_controller, tray_commands)) => {
+                    (Some(tray_controller), Some(tray_commands), None)
+                }
+                Err(error) => (None, None, Some(error)),
+            };
+            let window_size = size(px(WINDOW_WIDTH_PIXELS), px(WINDOW_HEIGHT_PIXELS));
+            let window_bounds = Bounds::centered(None, window_size, context);
+            let window_result = context.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(window_bounds)),
+                    ..WindowOptions::default()
+                },
+                move |window, context| {
+                    let window_handle = window.window_handle();
+                    let app = context.new(|cx| {
+                        InterpolateApp::new(
+                            cx,
+                            tray_controller,
+                            tray_commands,
+                            window_handle,
+                            tray_error,
+                        )
+                    });
+                    let weak_app = app.downgrade();
+                    window.on_window_should_close(context, move |window, context| {
+                        weak_app
+                            .update(context, |app, cx| {
+                                if app.running
+                                    && app.keep_running_background
+                                    && app.tray_controller.is_some()
+                                {
+                                    window.minimize_window();
+                                    app.status = "Running in background · use the tray to restore"
+                                        .to_owned();
+                                    cx.notify();
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .unwrap_or(true)
+                    });
+                    app
+                },
+            );
+            if let Err(error) = window_result {
+                eprintln!("failed to open the GPUI window: {error:#}");
+                context.quit();
+                return;
             }
-            Err(error) => (None, None, Some(error)),
-        };
-        let window_size = size(px(WINDOW_WIDTH_PIXELS), px(WINDOW_HEIGHT_PIXELS));
-        let window_bounds = Bounds::centered(None, window_size, context);
-        let window_result = context.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(window_bounds)),
-                ..WindowOptions::default()
-            },
-            move |window, context| {
-                let window_handle = window.window_handle();
-                let app = context.new(|cx| {
-                    InterpolateApp::new(
-                        cx,
-                        tray_controller,
-                        tray_commands,
-                        window_handle,
-                        tray_error,
-                    )
-                });
-                let weak_app = app.downgrade();
-                window.on_window_should_close(context, move |window, context| {
-                    weak_app
-                        .update(context, |app, cx| {
-                            if app.running
-                                && app.keep_running_background
-                                && app.tray_controller.is_some()
-                            {
-                                window.minimize_window();
-                                app.status =
-                                    "Running in background · use the tray to restore".to_owned();
-                                cx.notify();
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .unwrap_or(true)
-                });
-                app
-            },
-        );
-        if let Err(error) = window_result {
-            eprintln!("failed to open the GPUI window: {error:#}");
-            context.quit();
-            return;
-        }
-        context.activate(true);
-    });
+            context.activate(true);
+        });
     assert!(
         WINDOW_WIDTH_PIXELS.is_finite(),
         "window width must remain finite"

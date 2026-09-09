@@ -86,11 +86,24 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         build_directory.display()
     );
-    println!("cargo:rustc-link-lib=dylib=interpolate_backend");
     println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        build_directory.display()
+        "cargo:rustc-link-search=native={}",
+        build_directory.join("ncnn/src").display()
     );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_directory.join("ncnn/glslang/SPIRV").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_directory.join("ncnn/glslang/glslang").display()
+    );
+    println!("cargo:rustc-link-lib=static=interpolate_backend");
+    println!("cargo:rustc-link-lib=static=ncnn");
+    println!("cargo:rustc-link-lib=static=SPIRV");
+    println!("cargo:rustc-link-lib=static=glslang");
+    println!("cargo:rustc-link-lib=dylib=vulkan");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rerun-if-changed=native/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/interpolate_backend.cpp");
     println!("cargo:rerun-if-changed=native/interpolate_backend.h");

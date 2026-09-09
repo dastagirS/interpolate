@@ -21,7 +21,7 @@ The executable enters through a small `main` module. The deep desktop applicatio
 - Bounded memory: three RGB24 frame buffers, one active job, one inference call
 - Progress, output FPS, cancellation, atomic completion, and recoverable failed partial outputs
 - Bounded FFmpeg diagnostics with five rotating 1 MiB logs and 200 recent in-memory lines
-- Optional background processing through the Linux system tray
+- Background processing enabled by default through the Linux system tray when available; configurable in Settings
 - Native source picker, output picker, FPS input, and Vulkan device selector
 - Input/output paths accepted through the UI or as the first two command-line arguments
 - Anime diagnostics for detected held frames and smoothed cadence runs
@@ -103,13 +103,15 @@ See `legal/` and the license files retained inside `native/vendor/` for attribut
 
 Pushing a tag beginning with `v` runs `.github/workflows/release.yml`. The workflow must pass the complete quality gate before it performs a bounded, serial release build and publishes a Linux x86-64 archive containing the application, native backend, RIFE model, README, and license. CI runs the gate in the release profile and shares its dependency and native-build cache with the release workflow, so packaging reuses the artifacts already compiled for tests. A cold cache still requires a complete build. A manual workflow run requires a `v`-prefixed release tag and creates the same GitHub release from the selected commit. If that release already exists, the workflow stops before installing dependencies or building.
 
-After extracting the archive, launch the application through its top-level wrapper so it can locate the packaged native library:
+After extracting the archive, run the GUI executable:
 
 ```sh
 ./interpolate
 ```
 
-The target system must still provide a Vulkan driver, `ffmpeg`, and `ffprobe`. Background mode additionally requires a desktop implementing the freedesktop StatusNotifierItem system-tray protocol. On GNOME, that commonly requires an AppIndicator extension.
+That file is the application binary with the native backend linked in. Keep `models/rife-v4.25/` next to it. Double-clicking the executable opens the window without a terminal. Running it from an already-open terminal keeps that terminal attached, which is normal Linux behavior; ncnn may print GPU probe lines there. To add a menu entry, copy `share/applications/interpolate.desktop` into `~/.local/share/applications/` after placing `interpolate` on `PATH`.
+
+The target system must still provide a Vulkan driver, `ffmpeg`, and `ffprobe`. Background mode is enabled by default when the desktop implements the freedesktop StatusNotifierItem system-tray protocol, and can be disabled in Settings. On GNOME, that commonly requires an AppIndicator extension.
 
 ## Diagnostics
 

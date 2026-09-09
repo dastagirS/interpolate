@@ -32,7 +32,7 @@ _Avoid_: Deduplication, because output duration and timing are preserved
 The policy that prevents synthesis across a detected shot boundary.
 
 **Background mode**:
-An optional desktop behavior that keeps an active interpolation job running when the main window is closed. The window is restored and the job is cancelled or exited through the **System tray**.
+A desktop behavior enabled by default when a compatible tray is available that keeps an active interpolation job running when the main window is closed. The window is restored and the job is cancelled or exited through the **System tray**.
 _Avoid_: Daemon mode, because the process remains part of the interactive desktop session
 
 **System tray**:
@@ -48,7 +48,7 @@ The freedesktop StatusNotifierItem used to restore Interpolate, cancel the activ
 - The **Anime preset** enables half-scale UHD flow by default for 4K sources, but the user may override it.
 - Overriding a preset setting produces a **Modified content preset**.
 - Selecting a **Content preset** resets its settings to deterministic defaults and clears prior overrides.
-- **Background mode** is available only when the desktop exposes a compatible **System tray**.
+- **Background mode** is enabled by default when the desktop exposes a compatible **System tray**; it can be disabled in Settings.
 - Exiting from the **System tray** requests cancellation, waits for the active inference call and media cleanup, and then shuts down the backend.
 
 ## Example dialogue

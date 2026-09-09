@@ -70,7 +70,7 @@ foreach(SHADER_NAME IN LISTS RIFE_SHADER_NAMES)
     list(APPEND RIFE_GENERATED_HEADERS "${SHADER_HEADER}")
 endforeach()
 
-add_library(interpolate_backend SHARED
+add_library(interpolate_backend STATIC
     interpolate_backend.cpp
     rife/rife.cpp
     rife/warp.cpp

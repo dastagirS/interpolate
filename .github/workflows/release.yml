@@ -116,36 +116,31 @@ jobs:
           archive_name="$ARCHIVE_NAME"
           package_root="dist/${archive_name}"
 
-          mapfile -t backend_libraries < <(find target/release/build \
-            -path '*/out/native-build/libinterpolate_backend.so' -type f -print)
-          test "${#backend_libraries[@]}" -eq 1
-          test -s "${backend_libraries[0]}"
-
           mkdir -p \
-            "$package_root/bin" \
-            "$package_root/lib" \
-            "$package_root/share/interpolate/models/rife-v4.25" \
+            "$package_root/models/rife-v4.25" \
+            "$package_root/share/applications" \
             artifacts
-          install -m 0755 target/release/interpolate "$package_root/bin/interpolate"
-          install -m 0755 "${backend_libraries[0]}" "$package_root/lib/libinterpolate_backend.so"
+          install -m 0755 target/release/interpolate "$package_root/interpolate"
+          install -m 0644 packaging/interpolate.desktop \
+            "$package_root/share/applications/interpolate.desktop"
           install -m 0644 models/rife-v4.25/flownet.param \
-            "$package_root/share/interpolate/models/rife-v4.25/flownet.param"
+            "$package_root/models/rife-v4.25/flownet.param"
           install -m 0644 models/rife-v4.25/flownet.bin \
-            "$package_root/share/interpolate/models/rife-v4.25/flownet.bin"
+            "$package_root/models/rife-v4.25/flownet.bin"
           install -m 0644 README.md LICENSE "$package_root/"
 
-          cat > "$package_root/interpolate" <<'LAUNCHER'
-          #!/bin/sh
-          set -eu
-          installation_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-          test -n "$installation_root"
-          test -x "$installation_root/bin/interpolate"
-          export LD_LIBRARY_PATH="$installation_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          exec "$installation_root/bin/interpolate" "$@"
-          LAUNCHER
-          chmod 0755 "$package_root/interpolate"
+          test -x "$package_root/interpolate"
+          grep -Fq 'Terminal=false' "$package_root/share/applications/interpolate.desktop"
+          if head -c 2 "$package_root/interpolate" | grep -q '^#!'; then
+            echo 'Release launcher must be the GUI executable, not a shell script.' >&2
+            exit 1
+          fi
+          if ldd "$package_root/interpolate" | grep -q 'libinterpolate_backend'; then
+            echo 'GUI executable must statically contain the native backend.' >&2
+            exit 1
+          fi
 
-          LD_LIBRARY_PATH="$package_root/lib" ldd "$package_root/bin/interpolate" | tee dist/ldd.txt
+          ldd "$package_root/interpolate" | tee dist/ldd.txt
           if grep -q 'not found' dist/ldd.txt; then
             echo 'Packaged executable has unresolved shared libraries.' >&2
             exit 1

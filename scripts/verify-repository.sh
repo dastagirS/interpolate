@@ -19,6 +19,9 @@ printf '%s  %s\n%s  %s\n' \
 
 test -s Cargo.lock
 test -s LICENSE
+test -s packaging/interpolate.desktop
+grep -Fq 'Terminal=false' packaging/interpolate.desktop
+grep -Fq 'Type=Application' packaging/interpolate.desktop
 test -s legal/SOURCE-PROVENANCE.md
 test -s .github/CODEOWNERS
 grep -Fq '/.github/workflows/ @dastagirS' .github/CODEOWNERS

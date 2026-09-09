@@ -460,18 +460,17 @@ fn resolve_model_directory() -> Result<PathBuf, String> {
 
     let executable = std::env::current_exe()
         .map_err(|error| format!("failed to locate the application executable: {error}"))?;
-    if let Some(installation_root) = executable.parent().and_then(Path::parent) {
-        let installed_directory = installation_root.join(MODEL_DIRECTORY_RELATIVE);
-        if model_files_exist(&installed_directory) {
+    for model_directory in packaged_model_directories(&executable) {
+        if model_files_exist(&model_directory) {
             assert!(
-                installed_directory.is_dir(),
-                "installed model path must be a directory"
+                model_directory.is_dir(),
+                "packaged model path must be a directory"
             );
             assert!(
-                model_files_exist(&installed_directory),
-                "installed model files must exist"
+                model_files_exist(&model_directory),
+                "packaged model files must exist"
             );
-            return Ok(installed_directory);
+            return Ok(model_directory);
         }
     }
 
@@ -488,6 +487,30 @@ fn resolve_model_directory() -> Result<PathBuf, String> {
         "development model files must exist"
     );
     Ok(development_directory)
+}
+
+fn packaged_model_directories(executable: &Path) -> Vec<PathBuf> {
+    assert!(
+        !executable.as_os_str().is_empty(),
+        "executable path must not be empty"
+    );
+    assert!(
+        !MODEL_DIRECTORY_RELATIVE.is_empty(),
+        "installed model path must be configured"
+    );
+    let mut directories = Vec::new();
+    if let Some(executable_directory) = executable.parent() {
+        directories.push(executable_directory.join("models/rife-v4.25"));
+        directories.push(executable_directory.join(MODEL_DIRECTORY_RELATIVE));
+        if let Some(installation_root) = executable_directory.parent() {
+            directories.push(installation_root.join(MODEL_DIRECTORY_RELATIVE));
+        }
+    }
+    assert!(
+        directories.len() <= 3,
+        "packaged model search must remain bounded"
+    );
+    directories
 }
 
 fn model_files_exist(model_directory: &Path) -> bool {
