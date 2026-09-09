@@ -7,6 +7,12 @@ package_count=21
 test "$package_count" -gt 0
 test "$package_count" -le "$PACKAGE_COUNT_MAX"
 
+# GitHub-hosted Ubuntu images include third-party repositories that are not
+# needed by this project. Disable Chrome's repository because stale mirror
+# metadata can make an otherwise valid apt update fail with a hash mismatch.
+sudo rm -f \
+    /etc/apt/sources.list.d/google-chrome.list \
+    /etc/apt/sources.list.d/google-chrome.sources
 sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
     build-essential \
