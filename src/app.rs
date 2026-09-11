@@ -1,13 +1,16 @@
-use crate::backend::{gpu_names, shutdown as shutdown_backend};
+use crate::backend::{
+    InferenceBackend, cuda_inference_status, gpu_names, shutdown as shutdown_backend,
+};
 use crate::pipeline::{
-    CadenceDiagnostics, ContentPreset, JobConfiguration, JobUpdate, VideoMetadata,
+    CadenceDiagnostics, ContentPreset, EncoderPreset, H264Profile, JobConfiguration, JobUpdate,
+    PerformanceDiagnostics, VideoEncoder, VideoMetadata, available_video_encoders,
     default_output_path, probe_video, run_job,
 };
 use crate::tray::{TrayCommand, TrayController};
 use gpui::{
     AnyWindowHandle, App, Application, AssetSource, Bounds, Context, FocusHandle, KeyDownEvent,
-    PathPromptOptions, Render, SharedString, Timer, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, relative, rgb, size, svg,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Timer, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, size, svg,
 };
 use std::{
     borrow::Cow,
@@ -48,6 +51,36 @@ const TRAY_COMMAND_DRAIN_COUNT_MAX: usize = 4;
 const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
 const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+const ENCODING_QUALITY_MAX: u8 = 51;
+const ENCODER_THREAD_COUNT_MAX: u8 = 16;
+const X264_ENCODER_PRESETS: &[EncoderPreset] = &[
+    EncoderPreset::X264VeryFast,
+    EncoderPreset::X264Faster,
+    EncoderPreset::X264Fast,
+    EncoderPreset::X264Medium,
+    EncoderPreset::X264Slow,
+    EncoderPreset::X264Slower,
+    EncoderPreset::X264VerySlow,
+    EncoderPreset::X264Placebo,
+];
+const H264_PROFILES: &[H264Profile] = &[H264Profile::Auto, H264Profile::Main, H264Profile::High];
+const NVIDIA_ENCODER_PRESETS: &[EncoderPreset] = &[
+    EncoderPreset::NvidiaP1,
+    EncoderPreset::NvidiaP2,
+    EncoderPreset::NvidiaP3,
+    EncoderPreset::NvidiaP4,
+    EncoderPreset::NvidiaP5,
+    EncoderPreset::NvidiaP6,
+    EncoderPreset::NvidiaP7,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainPageTab {
+    Interpolation,
+    Hardware,
+    Encoding,
+    Media,
+}
 
 fn use_uhd_mode_default(content_preset: ContentPreset, metadata: Option<&VideoMetadata>) -> bool {
     assert!(UHD_WIDTH_MIN > 0, "UHD width threshold must be positive");
@@ -68,6 +101,75 @@ fn use_uhd_mode_default(content_preset: ContentPreset, metadata: Option<&VideoMe
         "automatic UHD mode requires source metadata"
     );
     use_uhd_mode
+}
+
+fn video_encoder_label(encoder: VideoEncoder) -> &'static str {
+    assert!(matches!(
+        encoder,
+        VideoEncoder::Automatic | VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
+    ));
+    let label = match encoder {
+        VideoEncoder::Automatic => "Auto · Best available H.264",
+        VideoEncoder::SoftwareH264 => "H.264 · CPU (x264)",
+        VideoEncoder::NvidiaH264 => "H.264 · NVIDIA NVENC",
+    };
+    assert!(!label.is_empty(), "encoder label must not be empty");
+    label
+}
+
+fn encoder_preset_label(preset: EncoderPreset) -> &'static str {
+    let label = match preset {
+        EncoderPreset::X264VeryFast => "x264 · Very Fast",
+        EncoderPreset::X264Faster => "x264 · Faster",
+        EncoderPreset::X264Fast => "x264 · Fast",
+        EncoderPreset::X264Medium => "x264 · Medium",
+        EncoderPreset::X264Slow => "x264 · Slow",
+        EncoderPreset::X264Slower => "x264 · Slower",
+        EncoderPreset::X264VerySlow => "x264 · Very Slow",
+        EncoderPreset::X264Placebo => "x264 · Placebo",
+        EncoderPreset::NvidiaP1 => "NVENC · P1",
+        EncoderPreset::NvidiaP2 => "NVENC · P2",
+        EncoderPreset::NvidiaP3 => "NVENC · P3",
+        EncoderPreset::NvidiaP4 => "NVENC · P4",
+        EncoderPreset::NvidiaP5 => "NVENC · P5",
+        EncoderPreset::NvidiaP6 => "NVENC · P6",
+        EncoderPreset::NvidiaP7 => "NVENC · P7",
+    };
+    assert!(!label.is_empty(), "encoder preset label must not be empty");
+    assert!(label.len() < 32, "encoder preset label must remain bounded");
+    label
+}
+
+fn encoder_preset_options(encoder: VideoEncoder) -> &'static [EncoderPreset] {
+    assert!(matches!(
+        encoder,
+        VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
+    ));
+    let options = match encoder {
+        VideoEncoder::SoftwareH264 => X264_ENCODER_PRESETS,
+        VideoEncoder::NvidiaH264 => NVIDIA_ENCODER_PRESETS,
+        VideoEncoder::Automatic => unreachable!("automatic encoder must be resolved"),
+    };
+    assert!(
+        !options.is_empty(),
+        "encoder preset options must not be empty"
+    );
+    assert!(
+        options.len() <= 9,
+        "encoder preset options must remain bounded"
+    );
+    options
+}
+
+fn h264_profile_label(profile: H264Profile) -> &'static str {
+    let label = match profile {
+        H264Profile::Auto => "Auto",
+        H264Profile::Main => "Main",
+        H264Profile::High => "High",
+    };
+    assert!(!label.is_empty(), "H.264 profile label must not be empty");
+    assert!(label.len() < 16, "H.264 profile label must remain bounded");
+    label
 }
 
 fn format_remaining_time(remaining_seconds: u64) -> String {
@@ -100,7 +202,6 @@ fn format_remaining_time(remaining_seconds: u64) -> String {
 
 const UHD_WIDTH_MIN: u32 = 3_840;
 const UHD_HEIGHT_MIN: u32 = 2_160;
-const HEADER_NAV_BUTTON_SIZE_PIXELS: f32 = 28.0;
 const HEADER_NAV_ICON_SIZE_PIXELS: f32 = 14.0;
 const HEADER_NAV_ICON_PATH_PAUSE: &str = "icons/pause.svg";
 const HEADER_NAV_ICON_PATH_SETTINGS: &str = "icons/settings.svg";
@@ -152,13 +253,36 @@ struct InterpolateApp {
     metadata: Option<VideoMetadata>,
     gpu_names: Vec<String>,
     selected_gpu_index: usize,
+    video_encoders: Vec<VideoEncoder>,
+    selected_video_encoder: usize,
+    use_nvdec: bool,
+    cuda_inference_available: bool,
+    cuda_inference_unavailable_reason: String,
+    cuda_inference_enabled: bool,
     gpu_menu_open: bool,
+    video_encoder_menu_open: bool,
     preset_menu_open: bool,
     settings_page: bool,
+    main_page_tab: MainPageTab,
     target_fps_num: u32,
     target_fps_input: String,
     target_fps_replace_on_type: bool,
     target_fps_focus: FocusHandle,
+    encoding_quality: u8,
+    encoding_quality_input: String,
+    encoding_quality_replace_on_type: bool,
+    encoding_quality_focus: FocusHandle,
+    encoder_preset: EncoderPreset,
+    encoder_preset_menu_open: bool,
+    h264_profile: H264Profile,
+    h264_profile_menu_open: bool,
+    encoder_thread_count: u8,
+    encoder_thread_count_input: String,
+    encoder_thread_count_replace_on_type: bool,
+    encoder_thread_count_focus: FocusHandle,
+    preserve_audio: bool,
+    preserve_subtitles: bool,
+    preserve_metadata: bool,
     content_preset: ContentPreset,
     scene_detection: bool,
     scene_detection_overridden: bool,
@@ -172,6 +296,7 @@ struct InterpolateApp {
     frame_count: u64,
     frame_count_estimate: u64,
     processing_fps: f64,
+    performance: PerformanceDiagnostics,
     cancellation: Option<Arc<AtomicBool>>,
     worker: Option<JoinHandle<()>>,
     tray_controller: Option<TrayController>,
@@ -208,6 +333,13 @@ impl InterpolateApp {
             Ok(_) => (Vec::new(), Some("No Vulkan GPU was found".to_owned())),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let video_encoders = available_video_encoders();
+        let cuda_status = cuda_inference_status();
+        let default_encoder_preset = if video_encoders.contains(&VideoEncoder::NvidiaH264) {
+            EncoderPreset::NvidiaP5
+        } else {
+            EncoderPreset::X264Medium
+        };
         let tray_available = tray_controller.is_some();
         let app = Self {
             input_path,
@@ -215,13 +347,36 @@ impl InterpolateApp {
             metadata,
             gpu_names,
             selected_gpu_index: 0,
+            video_encoders,
+            selected_video_encoder: 0,
+            use_nvdec: false,
+            cuda_inference_available: cuda_status.available,
+            cuda_inference_unavailable_reason: cuda_status.reason,
+            cuda_inference_enabled: false,
             gpu_menu_open: false,
+            video_encoder_menu_open: false,
             preset_menu_open: false,
             settings_page: false,
+            main_page_tab: MainPageTab::Interpolation,
             target_fps_num: 120,
             target_fps_input: "120".to_owned(),
             target_fps_replace_on_type: false,
             target_fps_focus: cx.focus_handle(),
+            encoding_quality: 18,
+            encoding_quality_input: "18".to_owned(),
+            encoding_quality_replace_on_type: false,
+            encoding_quality_focus: cx.focus_handle(),
+            encoder_preset: default_encoder_preset,
+            encoder_preset_menu_open: false,
+            h264_profile: H264Profile::Auto,
+            h264_profile_menu_open: false,
+            encoder_thread_count: 2,
+            encoder_thread_count_input: "2".to_owned(),
+            encoder_thread_count_replace_on_type: false,
+            encoder_thread_count_focus: cx.focus_handle(),
+            preserve_audio: true,
+            preserve_subtitles: true,
+            preserve_metadata: true,
             content_preset: ContentPreset::Movie,
             scene_detection: true,
             scene_detection_overridden: false,
@@ -235,6 +390,7 @@ impl InterpolateApp {
             frame_count: 0,
             frame_count_estimate: 0,
             processing_fps: 0.0,
+            performance: PerformanceDiagnostics::default(),
             cancellation: None,
             worker: None,
             tray_controller,
@@ -249,6 +405,30 @@ impl InterpolateApp {
         assert!(
             app.selected_gpu_index <= app.gpu_names.len(),
             "selected GPU index must be bounded"
+        );
+        assert!(
+            app.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            !app.use_nvdec || app.video_encoders.contains(&VideoEncoder::NvidiaH264),
+            "NVDEC requires an available NVIDIA encoder"
+        );
+        assert!(
+            !app.cuda_inference_enabled || app.cuda_inference_available,
+            "CUDA inference requires an available backend"
+        );
+        assert!(
+            !app.cuda_inference_unavailable_reason.is_empty(),
+            "CUDA availability must explain an unavailable backend"
+        );
+        assert!(
+            app.encoding_quality <= ENCODING_QUALITY_MAX,
+            "encoding quality must remain bounded"
+        );
+        assert!(
+            app.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+            "encoder thread count must remain bounded"
         );
         if let Some(tray_commands) = tray_commands {
             Self::poll_tray_commands(cx, tray_commands, window_handle);
@@ -510,12 +690,391 @@ impl InterpolateApp {
         );
     }
 
+    fn focus_encoding_quality(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.encoding_quality <= ENCODING_QUALITY_MAX,
+            "encoding quality must remain bounded"
+        );
+        assert!(
+            self.encoding_quality_input.len() <= 2,
+            "encoding quality input must remain bounded"
+        );
+        if !self.running {
+            self.encoding_quality_replace_on_type = true;
+            window.focus(&self.encoding_quality_focus);
+            cx.notify();
+        }
+        assert!(
+            self.encoding_quality_input.len() <= 2,
+            "focused encoding quality input must remain bounded"
+        );
+        assert!(self.encoding_quality <= ENCODING_QUALITY_MAX);
+    }
+
+    fn edit_encoding_quality(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.encoding_quality_input.len() <= 2,
+            "encoding quality input must remain bounded"
+        );
+        assert!(
+            self.encoding_quality <= ENCODING_QUALITY_MAX,
+            "encoding quality must remain bounded"
+        );
+        if self.running {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "backspace" => {
+                if self.encoding_quality_replace_on_type {
+                    self.encoding_quality_input.clear();
+                    self.encoding_quality_replace_on_type = false;
+                } else {
+                    self.encoding_quality_input.pop();
+                }
+            }
+            "enter" | "escape" => {
+                window.blur();
+                self.encoding_quality_replace_on_type = false;
+            }
+            _ => {
+                if let Some(character) = event.keystroke.key_char.as_deref()
+                    && character.len() == 1
+                    && character.as_bytes()[0].is_ascii_digit()
+                {
+                    if self.encoding_quality_replace_on_type {
+                        self.encoding_quality_input.clear();
+                        self.encoding_quality_replace_on_type = false;
+                    }
+                    if self.encoding_quality_input.len() < 2 {
+                        self.encoding_quality_input.push_str(character);
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
+        match self.encoding_quality_input.parse::<u8>() {
+            Ok(quality) if quality <= ENCODING_QUALITY_MAX => {
+                self.encoding_quality = quality;
+                self.error = None;
+            }
+            _ => {
+                self.error = Some(format!(
+                    "Encoding quality must be between 0 and {ENCODING_QUALITY_MAX}"
+                ))
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+        assert!(
+            self.encoding_quality_input.len() <= 2,
+            "edited encoding quality input must remain bounded"
+        );
+        assert!(
+            self.encoding_quality <= ENCODING_QUALITY_MAX,
+            "last valid encoding quality must remain bounded"
+        );
+    }
+
+    fn focus_encoder_thread_count(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+            "encoder thread count must remain bounded"
+        );
+        assert!(
+            self.encoder_thread_count_input.len() <= 2,
+            "encoder thread input must remain bounded"
+        );
+        if !self.running {
+            self.encoder_thread_count_replace_on_type = true;
+            window.focus(&self.encoder_thread_count_focus);
+            cx.notify();
+        }
+        assert!(
+            self.encoder_thread_count_input.len() <= 2,
+            "focused encoder thread input must remain bounded"
+        );
+        assert!(self.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX);
+    }
+
+    fn edit_encoder_thread_count(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.encoder_thread_count_input.len() <= 2,
+            "encoder thread input must remain bounded"
+        );
+        assert!(
+            self.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+            "encoder thread count must remain bounded"
+        );
+        if self.running {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "backspace" => {
+                if self.encoder_thread_count_replace_on_type {
+                    self.encoder_thread_count_input.clear();
+                    self.encoder_thread_count_replace_on_type = false;
+                } else {
+                    self.encoder_thread_count_input.pop();
+                }
+            }
+            "enter" | "escape" => {
+                window.blur();
+                self.encoder_thread_count_replace_on_type = false;
+            }
+            _ => {
+                if let Some(character) = event.keystroke.key_char.as_deref()
+                    && character.len() == 1
+                    && character.as_bytes()[0].is_ascii_digit()
+                {
+                    if self.encoder_thread_count_replace_on_type {
+                        self.encoder_thread_count_input.clear();
+                        self.encoder_thread_count_replace_on_type = false;
+                    }
+                    if self.encoder_thread_count_input.len() < 2 {
+                        self.encoder_thread_count_input.push_str(character);
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
+        match self.encoder_thread_count_input.parse::<u8>() {
+            Ok(thread_count) if thread_count <= ENCODER_THREAD_COUNT_MAX => {
+                self.encoder_thread_count = thread_count;
+                self.error = None;
+            }
+            _ => {
+                self.error = Some(format!(
+                    "Encoder threads must be between 0 and {ENCODER_THREAD_COUNT_MAX}"
+                ))
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+        assert!(
+            self.encoder_thread_count_input.len() <= 2,
+            "edited encoder thread input must remain bounded"
+        );
+        assert!(
+            self.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+            "last valid encoder thread count must remain bounded"
+        );
+    }
+
+    fn default_encoder_preset(&self, encoder: VideoEncoder) -> EncoderPreset {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(self.video_encoders.contains(&encoder) || encoder == VideoEncoder::Automatic);
+        let use_nvidia = encoder == VideoEncoder::NvidiaH264
+            || (encoder == VideoEncoder::Automatic
+                && self.video_encoders.contains(&VideoEncoder::NvidiaH264));
+        let preset = if use_nvidia {
+            EncoderPreset::NvidiaP5
+        } else {
+            EncoderPreset::X264Medium
+        };
+        assert!(matches!(
+            preset,
+            EncoderPreset::X264Medium | EncoderPreset::NvidiaP5
+        ));
+        preset
+    }
+
+    fn toggle_encoder_preset_menu(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(self.encoder_preset_menu_open || !self.running);
+        if !self.running {
+            self.encoder_preset_menu_open = !self.encoder_preset_menu_open;
+            self.h264_profile_menu_open = false;
+            cx.notify();
+        }
+        assert!(!self.encoder_preset_menu_open || !self.running);
+        assert!(!self.encoder_preset_menu_open || !self.h264_profile_menu_open);
+    }
+
+    fn select_encoder_preset(&mut self, preset: EncoderPreset, cx: &mut Context<Self>) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        if !self.running {
+            self.encoder_preset = preset;
+            self.encoder_preset_menu_open = false;
+            cx.notify();
+        }
+        assert!(!self.encoder_preset_menu_open || !self.running);
+        assert!(matches!(
+            self.encoder_preset,
+            EncoderPreset::X264VeryFast
+                | EncoderPreset::X264Faster
+                | EncoderPreset::X264Fast
+                | EncoderPreset::X264Medium
+                | EncoderPreset::X264Slow
+                | EncoderPreset::X264Slower
+                | EncoderPreset::X264VerySlow
+                | EncoderPreset::X264Placebo
+                | EncoderPreset::NvidiaP1
+                | EncoderPreset::NvidiaP2
+                | EncoderPreset::NvidiaP3
+                | EncoderPreset::NvidiaP4
+                | EncoderPreset::NvidiaP5
+                | EncoderPreset::NvidiaP6
+                | EncoderPreset::NvidiaP7
+        ));
+    }
+
+    fn toggle_h264_profile_menu(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(!self.h264_profile_menu_open || !self.running);
+        if !self.running {
+            self.h264_profile_menu_open = !self.h264_profile_menu_open;
+            self.encoder_preset_menu_open = false;
+            cx.notify();
+        }
+        assert!(!self.h264_profile_menu_open || !self.running);
+        assert!(!self.h264_profile_menu_open || !self.encoder_preset_menu_open);
+    }
+
+    fn select_h264_profile(&mut self, profile: H264Profile, cx: &mut Context<Self>) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        if !self.running {
+            self.h264_profile = profile;
+            self.h264_profile_menu_open = false;
+            cx.notify();
+        }
+        assert!(!self.h264_profile_menu_open || !self.running);
+        assert!(matches!(
+            self.h264_profile,
+            H264Profile::Auto | H264Profile::Main | H264Profile::High
+        ));
+    }
+
+    fn toggle_preserve_audio(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        let preserve_audio_before = self.preserve_audio;
+        if !self.running {
+            self.preserve_audio = !self.preserve_audio;
+            cx.notify();
+        }
+        assert!(
+            self.running || self.preserve_audio != preserve_audio_before,
+            "idle audio preservation toggle must change state"
+        );
+        assert!(
+            !self.running || self.preserve_audio == preserve_audio_before,
+            "running audio preservation toggle must not change state"
+        );
+    }
+
+    fn toggle_preserve_subtitles(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        let preserve_subtitles_before = self.preserve_subtitles;
+        if !self.running {
+            self.preserve_subtitles = !self.preserve_subtitles;
+            cx.notify();
+        }
+        assert!(
+            self.running || self.preserve_subtitles != preserve_subtitles_before,
+            "idle subtitle preservation toggle must change state"
+        );
+        assert!(
+            !self.running || self.preserve_subtitles == preserve_subtitles_before,
+            "running subtitle preservation toggle must not change state"
+        );
+    }
+
+    fn toggle_preserve_metadata(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        let preserve_metadata_before = self.preserve_metadata;
+        if !self.running {
+            self.preserve_metadata = !self.preserve_metadata;
+            cx.notify();
+        }
+        assert!(
+            self.running || self.preserve_metadata != preserve_metadata_before,
+            "idle metadata preservation toggle must change state"
+        );
+        assert!(
+            !self.running || self.preserve_metadata == preserve_metadata_before,
+            "running metadata preservation toggle must not change state"
+        );
+    }
+
     fn set_settings_page(&mut self, settings_page: bool, cx: &mut Context<Self>) {
         assert!(self.target_fps_num > 0, "target FPS must remain valid");
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
         self.settings_page = settings_page;
         self.gpu_menu_open = false;
+        self.video_encoder_menu_open = false;
         self.preset_menu_open = false;
+        self.encoder_preset_menu_open = false;
+        self.h264_profile_menu_open = false;
         cx.notify();
         assert!(
             !self.gpu_menu_open,
@@ -525,17 +1084,66 @@ impl InterpolateApp {
             !self.preset_menu_open,
             "settings navigation must close preset menus"
         );
+        assert!(
+            !self.video_encoder_menu_open,
+            "settings navigation must close encoder menus"
+        );
+        assert!(
+            !self.encoder_preset_menu_open && !self.h264_profile_menu_open,
+            "settings navigation must close encoding menus"
+        );
+    }
+
+    fn set_main_page_tab(&mut self, tab: MainPageTab, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must remain valid");
+        assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        if !self.running {
+            self.main_page_tab = tab;
+            self.preset_menu_open = false;
+            self.video_encoder_menu_open = false;
+            self.gpu_menu_open = false;
+            self.encoder_preset_menu_open = false;
+            self.h264_profile_menu_open = false;
+            cx.notify();
+        }
+        assert!(
+            !self.running || self.main_page_tab == tab,
+            "running jobs cannot change tabs"
+        );
+        assert!(
+            !self.preset_menu_open,
+            "tab changes must close preset menus"
+        );
+    }
+
+    fn select_main_page_tab(&mut self, tab: MainPageTab, cx: &mut Context<Self>) {
+        assert!(self.target_fps_num > 0, "target FPS must remain valid");
+        assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        self.set_main_page_tab(tab, cx);
+        assert_eq!(self.main_page_tab, tab, "selected tab must be retained");
+        assert!(
+            !self.preset_menu_open,
+            "selected tabs must close preset menus"
+        );
     }
 
     fn show_encode_page(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         assert!(self.target_fps_num > 0, "target FPS must remain valid");
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
         self.set_settings_page(false, cx);
     }
 
     fn show_settings_page(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         assert!(self.target_fps_num > 0, "target FPS must remain valid");
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
         self.set_settings_page(true, cx);
     }
 
@@ -547,7 +1155,10 @@ impl InterpolateApp {
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
         if !self.running && !self.gpu_names.is_empty() {
             self.gpu_menu_open = !self.gpu_menu_open;
+            self.video_encoder_menu_open = false;
             self.preset_menu_open = false;
+            self.encoder_preset_menu_open = false;
+            self.h264_profile_menu_open = false;
             cx.notify();
         }
         assert!(
@@ -581,12 +1192,125 @@ impl InterpolateApp {
         );
     }
 
+    fn toggle_video_encoder_menu(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            self.selected_video_encoder <= self.video_encoders.len(),
+            "selected encoder index must be bounded"
+        );
+        if !self.running && !self.video_encoders.is_empty() {
+            self.video_encoder_menu_open = !self.video_encoder_menu_open;
+            self.gpu_menu_open = false;
+            self.preset_menu_open = false;
+            self.encoder_preset_menu_open = false;
+            self.h264_profile_menu_open = false;
+            cx.notify();
+        }
+        assert!(
+            !self.video_encoders.is_empty() || !self.video_encoder_menu_open,
+            "empty encoder list cannot open a menu"
+        );
+        assert!(
+            !self.video_encoder_menu_open || !self.running,
+            "running state cannot retain an encoder menu"
+        );
+    }
+
+    fn select_video_encoder(&mut self, encoder_index: usize, cx: &mut Context<Self>) {
+        assert!(
+            encoder_index < self.video_encoders.len(),
+            "selected encoder index must exist"
+        );
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        if !self.running {
+            self.selected_video_encoder = encoder_index;
+            let selected_encoder = self.video_encoders[encoder_index];
+            self.encoder_preset = self.default_encoder_preset(selected_encoder);
+            self.video_encoder_menu_open = false;
+            cx.notify();
+        }
+        assert!(
+            self.selected_video_encoder < self.video_encoders.len(),
+            "updated encoder selection must be valid"
+        );
+        assert!(
+            !self.video_encoder_menu_open || !self.running,
+            "running state cannot retain an encoder menu"
+        );
+    }
+
+    fn toggle_cuda_inference(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            !self.cuda_inference_enabled || self.cuda_inference_available,
+            "CUDA inference requires an available backend"
+        );
+        assert!(
+            !self.cuda_inference_unavailable_reason.is_empty(),
+            "CUDA availability must explain an unavailable backend"
+        );
+        if !self.running && self.cuda_inference_available {
+            self.cuda_inference_enabled = !self.cuda_inference_enabled;
+            cx.notify();
+        }
+        assert!(
+            !self.cuda_inference_enabled || self.cuda_inference_available,
+            "updated CUDA inference selection requires an available backend"
+        );
+        assert!(
+            self.cuda_inference_unavailable_reason.len() < 256,
+            "CUDA availability reason must remain bounded"
+        );
+    }
+
+    fn toggle_nvdec(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        let nvdec_available = self.video_encoders.contains(&VideoEncoder::NvidiaH264);
+        assert!(
+            !self.use_nvdec || nvdec_available,
+            "NVDEC cannot be enabled without NVIDIA support"
+        );
+        if !self.running && nvdec_available {
+            self.use_nvdec = !self.use_nvdec;
+            cx.notify();
+        }
+        assert!(
+            !self.use_nvdec || self.video_encoders.contains(&VideoEncoder::NvidiaH264),
+            "updated NVDEC selection requires NVIDIA support"
+        );
+        assert!(
+            !self.running || !self.use_nvdec || nvdec_available,
+            "running NVDEC requires support"
+        );
+    }
+
     fn toggle_preset_menu(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         assert!(self.target_fps_num > 0, "target FPS must be positive");
         assert!(self.target_fps_num <= 480, "target FPS must stay bounded");
         if !self.running {
             self.preset_menu_open = !self.preset_menu_open;
             self.gpu_menu_open = false;
+            self.video_encoder_menu_open = false;
+            self.encoder_preset_menu_open = false;
+            self.h264_profile_menu_open = false;
             cx.notify();
         }
         assert!(
@@ -734,6 +1458,14 @@ impl InterpolateApp {
             self.selected_gpu_index <= self.gpu_names.len(),
             "GPU selection must be bounded"
         );
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            self.selected_video_encoder <= self.video_encoders.len(),
+            "encoder selection must be bounded"
+        );
         if self.running {
             return;
         }
@@ -748,6 +1480,30 @@ impl InterpolateApp {
             return;
         }
         self.target_fps_num = target_fps_num;
+        if self.encoding_quality_input.parse::<u8>().is_err()
+            || self
+                .encoding_quality_input
+                .parse::<u8>()
+                .is_ok_and(|value| value > ENCODING_QUALITY_MAX)
+        {
+            self.error = Some(format!(
+                "Encoding quality must be between 0 and {ENCODING_QUALITY_MAX}"
+            ));
+            cx.notify();
+            return;
+        }
+        if self.encoder_thread_count_input.parse::<u8>().is_err()
+            || self
+                .encoder_thread_count_input
+                .parse::<u8>()
+                .is_ok_and(|value| value > ENCODER_THREAD_COUNT_MAX)
+        {
+            self.error = Some(format!(
+                "Encoder threads must be between 0 and {ENCODER_THREAD_COUNT_MAX}"
+            ));
+            cx.notify();
+            return;
+        }
         let Some(input_path) = self.input_path.clone() else {
             self.error = Some("Choose an input video".to_owned());
             cx.notify();
@@ -760,6 +1516,16 @@ impl InterpolateApp {
         };
         if self.gpu_names.is_empty() {
             self.error = Some("A Vulkan GPU is required".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.video_encoders.is_empty() {
+            self.error = Some("FFmpeg has no supported H.264 encoder".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.selected_video_encoder >= self.video_encoders.len() {
+            self.error = Some("Choose a supported video encoder".to_owned());
             cx.notify();
             return;
         }
@@ -778,6 +1544,23 @@ impl InterpolateApp {
             content_preset: self.content_preset,
             scene_detection: self.scene_detection,
             use_uhd_mode: self.use_uhd_mode,
+            use_nvdec: self.use_nvdec,
+            inference_backend: if self.cuda_inference_enabled {
+                InferenceBackend::CudaPytorchVapourSynth
+            } else {
+                InferenceBackend::VulkanNcnn
+            },
+            video_encoder: *self
+                .video_encoders
+                .get(self.selected_video_encoder)
+                .unwrap_or(&VideoEncoder::Automatic),
+            encoder_preset: self.encoder_preset,
+            quality_level: self.encoding_quality,
+            h264_profile: self.h264_profile,
+            encoder_thread_count: self.encoder_thread_count,
+            preserve_audio: self.preserve_audio,
+            preserve_subtitles: self.preserve_subtitles,
+            preserve_metadata: self.preserve_metadata,
         };
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
@@ -797,13 +1580,17 @@ impl InterpolateApp {
         self.running = true;
         self.worker = Some(worker);
         self.gpu_menu_open = false;
+        self.video_encoder_menu_open = false;
         self.preset_menu_open = false;
+        self.encoder_preset_menu_open = false;
+        self.h264_profile_menu_open = false;
         self.status = "Starting job".to_owned();
         self.error = None;
         self.progress = 0.0;
         self.frame_count = 0;
         self.frame_count_estimate = 0;
         self.processing_fps = 0.0;
+        self.performance = PerformanceDiagnostics::default();
         self.cadence_diagnostics = CadenceDiagnostics::default();
         self.cancellation = Some(cancellation);
         if let Some(tray_controller) = &self.tray_controller
@@ -898,10 +1685,12 @@ impl InterpolateApp {
                 processing_fps,
                 progress,
                 cadence_diagnostics,
+                performance,
             } => {
                 self.frame_count = frame_count;
                 self.frame_count_estimate = frame_count_estimate;
                 self.processing_fps = processing_fps;
+                self.performance = performance;
                 self.progress = progress.clamp(0.0, 1.0);
                 self.cadence_diagnostics = cadence_diagnostics;
             }
@@ -956,6 +1745,755 @@ impl InterpolateApp {
     }
 }
 
+impl InterpolateApp {
+    fn render_encoding_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        assert!(
+            self.encoding_quality <= ENCODING_QUALITY_MAX,
+            "encoding quality must remain bounded"
+        );
+        assert!(
+            self.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+            "encoder threads must remain bounded"
+        );
+        let selected_encoder = self
+            .video_encoders
+            .get(self.selected_video_encoder)
+            .copied()
+            .unwrap_or(VideoEncoder::Automatic);
+        let resolved_encoder = if selected_encoder == VideoEncoder::NvidiaH264 {
+            VideoEncoder::NvidiaH264
+        } else {
+            VideoEncoder::SoftwareH264
+        };
+        let preset_options = encoder_preset_options(resolved_encoder);
+        let quality_mode_label = if resolved_encoder == VideoEncoder::NvidiaH264 {
+            "CQ"
+        } else {
+            "CRF"
+        };
+        let quality_focused = self.encoding_quality_focus.is_focused(window);
+        let quality_valid = self
+            .encoding_quality_input
+            .parse::<u8>()
+            .is_ok_and(|value| value <= ENCODING_QUALITY_MAX);
+        let thread_focused = self.encoder_thread_count_focus.is_focused(window);
+        let thread_valid = self
+            .encoder_thread_count_input
+            .parse::<u8>()
+            .is_ok_and(|value| value <= ENCODER_THREAD_COUNT_MAX);
+        let card = div()
+            .w_full()
+            .relative()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER_COLOR))
+            .bg(rgb(PANEL_COLOR))
+            .child(
+                div()
+                    .px_4()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(div().font_family("JetBrains Mono").child("Encoding"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .child("Output controls for this encoding"),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("Quality").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child(format!(
+                                    "{quality_mode_label}; lower values mean higher quality"
+                                )),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-encoding-quality-input")
+                            .track_focus(&self.encoding_quality_focus)
+                            .on_key_down(cx.listener(Self::edit_encoding_quality))
+                            .on_click(cx.listener(Self::focus_encoding_quality))
+                            .w(px(112.0))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .rounded_md()
+                            .cursor_text()
+                            .border_1()
+                            .border_color(rgb(if !quality_valid {
+                                ERROR_COLOR
+                            } else if quality_focused {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .font_family("JetBrains Mono")
+                            .child(self.encoding_quality_input.clone())
+                            .child(
+                                div()
+                                    .ml_2()
+                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                    .child(quality_mode_label),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("Speed preset").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child("Controls the quality/speed trade-off"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-encoder-preset-selector")
+                            .w(px(270.0))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if self.encoder_preset_menu_open {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .font_family("JetBrains Mono")
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .on_click(cx.listener(Self::toggle_encoder_preset_menu))
+                            .child(encoder_preset_label(self.encoder_preset))
+                            .child(if self.encoder_preset_menu_open {
+                                "⌃"
+                            } else {
+                                "⌄"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("H.264 profile").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child("Auto is recommended for compatibility"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-h264-profile-selector")
+                            .w(px(270.0))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if self.h264_profile_menu_open {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .font_family("JetBrains Mono")
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .on_click(cx.listener(Self::toggle_h264_profile_menu))
+                            .child(h264_profile_label(self.h264_profile))
+                            .child(if self.h264_profile_menu_open {
+                                "⌃"
+                            } else {
+                                "⌄"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div().child("Encoder threads").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child("0 means FFmpeg automatic mode"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-encoder-thread-count-input")
+                            .track_focus(&self.encoder_thread_count_focus)
+                            .on_key_down(cx.listener(Self::edit_encoder_thread_count))
+                            .on_click(cx.listener(Self::focus_encoder_thread_count))
+                            .w(px(112.0))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .rounded_md()
+                            .cursor_text()
+                            .border_1()
+                            .border_color(rgb(if !thread_valid {
+                                ERROR_COLOR
+                            } else if thread_focused {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .font_family("JetBrains Mono")
+                            .child(self.encoder_thread_count_input.clone())
+                            .child(
+                                div()
+                                    .ml_2()
+                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                    .child("threads"),
+                            ),
+                    ),
+            )
+            .when(self.encoder_preset_menu_open, |element| {
+                element.child(
+                    div()
+                        .id("main-encoder-preset-options")
+                        .absolute()
+                        .top(px(140.0))
+                        .right(px(16.0))
+                        .w(px(270.0))
+                        .h(px(324.0))
+                        .overflow_y_scroll()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG_COLOR))
+                        .bg(rgb(PANEL_COLOR))
+                        .shadow_lg()
+                        .children(preset_options.iter().copied().enumerate().map(
+                            |(index, preset)| {
+                                let selected = preset == self.encoder_preset;
+                                div()
+                                    .id(("main-encoder-preset-option", index))
+                                    .h(px(36.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor_pointer()
+                                    .bg(rgb(if selected {
+                                        SELECTED_COLOR
+                                    } else {
+                                        PANEL_COLOR
+                                    }))
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.select_encoder_preset(preset, cx)
+                                    }))
+                                    .child(encoder_preset_label(preset))
+                                    .child(if selected { "✓" } else { "" })
+                            },
+                        )),
+                )
+            })
+            .when(self.h264_profile_menu_open, |element| {
+                element.child(
+                    div()
+                        .id("main-h264-profile-options")
+                        .absolute()
+                        .top(px(204.0))
+                        .right(px(16.0))
+                        .w(px(270.0))
+                        .h(px(108.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG_COLOR))
+                        .bg(rgb(PANEL_COLOR))
+                        .shadow_lg()
+                        .children(H264_PROFILES.iter().copied().enumerate().map(
+                            |(index, profile)| {
+                                let selected = profile == self.h264_profile;
+                                div()
+                                    .id(("main-h264-profile-option", index))
+                                    .h(px(36.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor_pointer()
+                                    .bg(rgb(if selected {
+                                        SELECTED_COLOR
+                                    } else {
+                                        PANEL_COLOR
+                                    }))
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.select_h264_profile(profile, cx)
+                                    }))
+                                    .child(h264_profile_label(profile))
+                                    .child(if selected { "✓" } else { "" })
+                            },
+                        )),
+                )
+            });
+        assert!(
+            preset_options.len() <= 9,
+            "encoding preset options must remain bounded"
+        );
+        assert!(
+            H264_PROFILES.len() <= 3,
+            "H.264 profile options must remain bounded"
+        );
+        card
+    }
+
+    fn render_hardware_tab(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            self.selected_gpu_index <= self.gpu_names.len(),
+            "GPU selection must remain bounded"
+        );
+        let selected_encoder = self
+            .video_encoders
+            .get(self.selected_video_encoder)
+            .copied()
+            .unwrap_or(VideoEncoder::Automatic);
+        let gpu_label = self
+            .gpu_names
+            .get(self.selected_gpu_index)
+            .cloned()
+            .unwrap_or_else(|| "No Vulkan device".to_owned());
+        let cuda_description = if self.cuda_inference_available {
+            "Vulkan or CUDA/PyTorch + VapourSynth".to_owned()
+        } else {
+            self.cuda_inference_unavailable_reason.clone()
+        };
+        let nvdec_available = self.video_encoders.contains(&VideoEncoder::NvidiaH264);
+        div()
+            .w_full()
+            .relative()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER_COLOR))
+            .bg(rgb(PANEL_COLOR))
+            .child(
+                div()
+                    .px_4()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(div().font_family("JetBrains Mono").child("Hardware"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .child("Select the acceleration devices for this encoding."),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(76.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("RIFE inference backend").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child(cuda_description),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-inference-backend")
+                            .w(px(112.0))
+                            .h(px(28.0))
+                            .p(px(2.0))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .when(self.cuda_inference_enabled, |element| element.justify_end())
+                            .when(self.cuda_inference_available, |element| {
+                                element
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(Self::toggle_cuda_inference))
+                            })
+                            .bg(rgb(if self.cuda_inference_enabled {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_STRONG_COLOR
+                            }))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .text_xs()
+                                    .font_family("JetBrains Mono")
+                                    .text_color(rgb(TEXT_COLOR))
+                                    .child(if self.cuda_inference_enabled {
+                                        "CUDA"
+                                    } else {
+                                        "Vulkan"
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("Video encoder").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child("Hardware acceleration is tested at startup"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-hardware-encoder-selector")
+                            .w(px(270.0))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if self.video_encoder_menu_open {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .font_family("JetBrains Mono")
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .on_click(cx.listener(Self::toggle_video_encoder_menu))
+                            .child(video_encoder_label(selected_encoder))
+                            .child(if self.video_encoder_menu_open {
+                                "⌃"
+                            } else {
+                                "⌄"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        div().child("NVIDIA hardware decode").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child(if nvdec_available {
+                                    "Optional NVDEC acceleration for video decoding"
+                                } else {
+                                    "Unavailable: NVIDIA FFmpeg decode support not detected"
+                                }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-hardware-nvdec-toggle")
+                            .w(px(40.0))
+                            .h(px(22.0))
+                            .p(px(2.0))
+                            .flex()
+                            .items_center()
+                            .justify_start()
+                            .when(self.use_nvdec, |element| element.justify_end())
+                            .rounded_full()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if self.use_nvdec {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_STRONG_COLOR
+                            }))
+                            .bg(rgb(if self.use_nvdec {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .on_click(cx.listener(Self::toggle_nvdec))
+                            .child(div().size(px(16.0)).rounded_full().bg(rgb(TEXT_COLOR))),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(64.0))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div().child("Compute device").child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                .child("Vulkan inference device"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("main-hardware-gpu-selector")
+                            .w(px(270.0))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if self.gpu_menu_open {
+                                ACCENT_COLOR
+                            } else {
+                                BORDER_COLOR
+                            }))
+                            .bg(rgb(PANEL_COLOR))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .font_family("JetBrains Mono")
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .on_click(cx.listener(Self::toggle_gpu_menu))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(gpu_label),
+                            )
+                            .child(if self.gpu_menu_open { "⌃" } else { "⌄" }),
+                    ),
+            )
+            .when(self.video_encoder_menu_open, |element| {
+                element.child(
+                    div()
+                        .id("main-hardware-encoder-options")
+                        .absolute()
+                        .top(px(140.0))
+                        .right(px(16.0))
+                        .w(px(270.0))
+                        .h(px(108.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG_COLOR))
+                        .bg(rgb(PANEL_COLOR))
+                        .shadow_lg()
+                        .children(self.video_encoders.iter().copied().enumerate().map(
+                            |(index, encoder)| {
+                                let selected = index == self.selected_video_encoder;
+                                div()
+                                    .id(("main-hardware-encoder-option", index))
+                                    .h(px(36.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor_pointer()
+                                    .bg(rgb(if selected {
+                                        SELECTED_COLOR
+                                    } else {
+                                        PANEL_COLOR
+                                    }))
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.select_video_encoder(index, cx)
+                                    }))
+                                    .child(video_encoder_label(encoder))
+                                    .child(if selected { "✓" } else { "" })
+                            },
+                        )),
+                )
+            })
+            .when(self.gpu_menu_open, |element| {
+                element.child(
+                    div()
+                        .id("main-hardware-gpu-options")
+                        .absolute()
+                        .top(px(268.0))
+                        .right(px(16.0))
+                        .w(px(270.0))
+                        .h(px(144.0))
+                        .overflow_y_scroll()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER_STRONG_COLOR))
+                        .bg(rgb(PANEL_COLOR))
+                        .shadow_lg()
+                        .children(self.gpu_names.iter().enumerate().map(|(index, name)| {
+                            let selected = index == self.selected_gpu_index;
+                            div()
+                                .id(("main-hardware-gpu-option", index))
+                                .h(px(36.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .bg(rgb(if selected {
+                                    SELECTED_COLOR
+                                } else {
+                                    PANEL_COLOR
+                                }))
+                                .on_click(
+                                    cx.listener(move |app, _, _, cx| app.select_gpu(index, cx)),
+                                )
+                                .child(name.clone())
+                                .child(if selected { "✓" } else { "" })
+                        })),
+                )
+            })
+    }
+
+    fn render_media_tab(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            !self.running || self.cancellation.is_some(),
+            "running media settings require a cancellation handle"
+        );
+        div()
+            .w_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER_COLOR))
+            .bg(rgb(PANEL_COLOR))
+            .child(
+                div()
+                    .px_4()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(div().font_family("JetBrains Mono").child("Media streams"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED_COLOR))
+                            .child("Choose which source streams are copied into this encoding."),
+                    ),
+            )
+            .children(
+                [
+                    ("Audio", "preserve-audio-main", self.preserve_audio),
+                    (
+                        "Subtitles",
+                        "preserve-subtitles-main",
+                        self.preserve_subtitles,
+                    ),
+                    ("Metadata", "preserve-metadata-main", self.preserve_metadata),
+                ]
+                .into_iter()
+                .map(|(label, id, enabled)| {
+                    let toggle = div()
+                        .id(id)
+                        .px_3()
+                        .py_1()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(rgb(if enabled { ACCENT_COLOR } else { BORDER_COLOR }))
+                        .bg(rgb(if enabled { ACCENT_COLOR } else { PANEL_COLOR }))
+                        .child(if enabled { "✓ Keep" } else { "Do not keep" });
+                    let toggle = match label {
+                        "Audio" => toggle.on_click(cx.listener(Self::toggle_preserve_audio)),
+                        "Subtitles" => {
+                            toggle.on_click(cx.listener(Self::toggle_preserve_subtitles))
+                        }
+                        "Metadata" => toggle.on_click(cx.listener(Self::toggle_preserve_metadata)),
+                        _ => unreachable!("media tab label must be known"),
+                    };
+                    div()
+                        .h(px(56.0))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(rgb(BORDER_COLOR))
+                        .child(label)
+                        .child(toggle)
+                }),
+            )
+    }
+}
+
 impl Render for InterpolateApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         assert!(
@@ -965,6 +2503,22 @@ impl Render for InterpolateApp {
         assert!(
             self.selected_gpu_index <= self.gpu_names.len(),
             "rendered GPU index must be bounded"
+        );
+        assert!(
+            self.selected_video_encoder <= self.video_encoders.len(),
+            "rendered encoder index must be bounded"
+        );
+        assert!(
+            self.video_encoders.len() <= 3,
+            "encoder list must remain bounded"
+        );
+        assert!(
+            !self.cuda_inference_enabled || self.cuda_inference_available,
+            "rendered CUDA inference must be available when enabled"
+        );
+        assert!(
+            !self.cuda_inference_unavailable_reason.is_empty(),
+            "CUDA availability reason must not be empty"
         );
 
         let input_name = self
@@ -1012,6 +2566,41 @@ impl Render for InterpolateApp {
             .get(self.selected_gpu_index)
             .cloned()
             .unwrap_or_else(|| "No Vulkan device".to_owned());
+        let selected_video_encoder = self
+            .video_encoders
+            .get(self.selected_video_encoder)
+            .copied()
+            .unwrap_or(VideoEncoder::Automatic);
+        let selected_video_encoder_label = video_encoder_label(selected_video_encoder);
+        let nvdec_available = self.video_encoders.contains(&VideoEncoder::NvidiaH264);
+        let cuda_inference_description = if self.cuda_inference_available {
+            "Choose Vulkan/ncnn or CUDA/PyTorch + VapourSynth".to_owned()
+        } else {
+            self.cuda_inference_unavailable_reason.clone()
+        };
+        let encoder_for_settings = if selected_video_encoder == VideoEncoder::NvidiaH264
+            || (selected_video_encoder == VideoEncoder::Automatic && nvdec_available)
+        {
+            VideoEncoder::NvidiaH264
+        } else {
+            VideoEncoder::SoftwareH264
+        };
+        let encoder_preset_options = encoder_preset_options(encoder_for_settings);
+        let quality_mode_label = if encoder_for_settings == VideoEncoder::NvidiaH264 {
+            "CQ"
+        } else {
+            "CRF"
+        };
+        let quality_focused = self.encoding_quality_focus.is_focused(window);
+        let encoding_quality_valid = self
+            .encoding_quality_input
+            .parse::<u8>()
+            .is_ok_and(|value| value <= ENCODING_QUALITY_MAX);
+        let encoder_thread_count_focused = self.encoder_thread_count_focus.is_focused(window);
+        let encoder_thread_count_valid = self
+            .encoder_thread_count_input
+            .parse::<u8>()
+            .is_ok_and(|value| value <= ENCODER_THREAD_COUNT_MAX);
         let frame_label = if self.frame_count_estimate > 0 {
             format!(
                 "{} / {} frames",
@@ -1025,6 +2614,12 @@ impl Render for InterpolateApp {
         } else {
             "GPU idle".to_owned()
         };
+        let stage_speed_label = format!(
+            "I {:.2} · D {:.2} · E {:.2}",
+            self.performance.inference_fps,
+            self.performance.decode_fps,
+            self.performance.encode_fps,
+        );
         let eta_label = if self.processing_fps > 0.0 && self.frame_count_estimate > self.frame_count
         {
             let remaining_seconds = ((self.frame_count_estimate - self.frame_count) as f64
@@ -1052,9 +2647,11 @@ impl Render for InterpolateApp {
             preset_name.to_owned()
         };
         let gpu_menu_height = px((self.gpu_names.len().clamp(1, 4) * 36) as f32);
+        let video_encoder_menu_height = px((self.video_encoders.len().clamp(1, 3) * 36) as f32);
         let can_start = !self.running
             && self.input_path.is_some()
             && !self.gpu_names.is_empty()
+            && !self.video_encoders.is_empty()
             && target_fps_valid;
         let status_color = if self.error.is_some() {
             ERROR_COLOR
@@ -1099,23 +2696,31 @@ impl Render for InterpolateApp {
                                     .text_xs()
                                     .child("I"),
                             )
-                            .child("Interpolate")
+                            .child("Interpolate"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .justify_center()
                             .child(
                                 div()
-                                    .ml_3()
+                                    .h(px(34.0))
                                     .flex()
-                                    .rounded_md()
+                                    .items_center()
+                                    .rounded_full()
                                     .border_1()
                                     .border_color(rgb(BORDER_COLOR))
                                     .bg(rgb(PANEL_COLOR))
                                     .child(
                                         div()
                                             .id("encode-page")
-                                            .size(px(HEADER_NAV_BUTTON_SIZE_PIXELS))
-                                            .rounded_md()
+                                            .h(px(30.0))
+                                            .px_4()
+                                            .rounded_full()
                                             .flex()
                                             .items_center()
-                                            .justify_center()
+                                            .gap_2()
                                             .cursor_pointer()
                                             .bg(rgb(if !self.settings_page {
                                                 SELECTED_COLOR
@@ -1131,16 +2736,18 @@ impl Render for InterpolateApp {
                                                 } else {
                                                     TEXT_MUTED_COLOR
                                                 },
-                                            )),
+                                            ))
+                                            .child("Encode"),
                                     )
                                     .child(
                                         div()
                                             .id("settings-page")
-                                            .size(px(HEADER_NAV_BUTTON_SIZE_PIXELS))
-                                            .rounded_md()
+                                            .h(px(30.0))
+                                            .px_4()
+                                            .rounded_full()
                                             .flex()
                                             .items_center()
-                                            .justify_center()
+                                            .gap_2()
                                             .cursor_pointer()
                                             .bg(rgb(if self.settings_page {
                                                 SELECTED_COLOR
@@ -1156,7 +2763,8 @@ impl Render for InterpolateApp {
                                                 } else {
                                                     TEXT_MUTED_COLOR
                                                 },
-                                            )),
+                                            ))
+                                            .child("Settings"),
                                     ),
                             ),
                     )
@@ -1177,7 +2785,7 @@ impl Render for InterpolateApp {
                                     .id("cancel-job-toolbar")
                                     .px_3()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_full()
                                     .cursor_pointer()
                                     .border_1()
                                     .border_color(rgb(BORDER_STRONG_COLOR))
@@ -1189,7 +2797,7 @@ impl Render for InterpolateApp {
                                     .id("start-job-toolbar")
                                     .px_4()
                                     .py_2()
-                                    .rounded_md()
+                                    .rounded_full()
                                     .cursor_pointer()
                                     .bg(rgb(if can_start {
                                         PRIMARY_BUTTON_COLOR
@@ -1283,11 +2891,13 @@ impl Render for InterpolateApp {
             )
             .child(if self.settings_page {
                 div()
+                    .id("settings-scroll")
                     .flex_1()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .p_5()
                     .flex()
                     .flex_col()
+                    .items_center()
                     .gap_4()
                     .child(
                         div()
@@ -1378,6 +2988,483 @@ impl Render for InterpolateApp {
                     )
                     .child(
                         div()
+                            .mt_2()
+                            .w(px(640.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .bg(rgb(PANEL_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_4()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div()
+                                            .font_family("JetBrains Mono")
+                                            .child("Inference acceleration"),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .child("Choose the neural-network backend when it is available."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(76.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div().child("RIFE inference backend").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child(cuda_inference_description),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("settings-inference-backend")
+                                            .w(px(112.0))
+                                            .h(px(28.0))
+                                            .p(px(2.0))
+                                            .flex()
+                                            .when(self.cuda_inference_enabled, |element| {
+                                                element.justify_end()
+                                            })
+                                            .items_center()
+                                            .rounded_full()
+                                            .when(self.cuda_inference_available, |element| {
+                                                element
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(Self::toggle_cuda_inference))
+                                            })
+                                            .bg(rgb(if self.cuda_inference_available
+                                                && self.cuda_inference_enabled
+                                            {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_STRONG_COLOR
+                                            }))
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .text_xs()
+                                                    .font_family("JetBrains Mono")
+                                                    .text_color(rgb(TEXT_COLOR))
+                                                    .child(if self.cuda_inference_enabled {
+                                                        "CUDA"
+                                                    } else {
+                                                        "Vulkan"
+                                                    }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .mt_2()
+                            .w(px(640.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .bg(rgb(PANEL_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_4()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div()
+                                            .font_family("JetBrains Mono")
+                                            .child("Encoding"),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .child("These settings are independent of the Movie and Anime presets."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(64.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div().child("Video encoder").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child("Choose the encoder on the Encode page; Auto prefers NVENC when available."),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family("JetBrains Mono")
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .child(selected_video_encoder_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(64.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div().child("Quality").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child(format!("{quality_mode_label}; lower values mean higher quality and larger files")),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("encoding-quality-input")
+                                            .track_focus(&self.encoding_quality_focus)
+                                            .on_key_down(cx.listener(Self::edit_encoding_quality))
+                                            .on_click(cx.listener(Self::focus_encoding_quality))
+                                            .w(px(112.0))
+                                            .px_3()
+                                            .py_2()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .rounded_md()
+                                            .cursor_text()
+                                            .border_1()
+                                            .border_color(rgb(if !encoding_quality_valid {
+                                                ERROR_COLOR
+                                            } else if quality_focused {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_COLOR
+                                            }))
+                                            .bg(rgb(PANEL_COLOR))
+                                            .font_family("JetBrains Mono")
+                                            .child(self.encoding_quality_input.clone())
+                                            .child(
+                                                div()
+                                                    .ml_2()
+                                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                                    .child(quality_mode_label),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(64.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div().child("Speed preset").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child("Controls the quality/speed trade-off"),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("encoder-preset-selector")
+                                            .w(px(270.0))
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(if self.encoder_preset_menu_open {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_COLOR
+                                            }))
+                                            .bg(rgb(PANEL_COLOR))
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .font_family("JetBrains Mono")
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .on_click(cx.listener(Self::toggle_encoder_preset_menu))
+                                            .child(encoder_preset_label(self.encoder_preset))
+                                            .child(if self.encoder_preset_menu_open { "⌃" } else { "⌄" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(64.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div().child("H.264 profile").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child("Auto is recommended for compatibility"),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("h264-profile-selector")
+                                            .w(px(270.0))
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(if self.h264_profile_menu_open {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_COLOR
+                                            }))
+                                            .bg(rgb(PANEL_COLOR))
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .font_family("JetBrains Mono")
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                            .on_click(cx.listener(Self::toggle_h264_profile_menu))
+                                            .child(h264_profile_label(self.h264_profile))
+                                            .child(if self.h264_profile_menu_open { "⌃" } else { "⌄" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(64.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div().child("Encoder threads").child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                .child("0 means FFmpeg automatic mode"),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("encoder-thread-count-input")
+                                            .track_focus(&self.encoder_thread_count_focus)
+                                            .on_key_down(cx.listener(Self::edit_encoder_thread_count))
+                                            .on_click(cx.listener(Self::focus_encoder_thread_count))
+                                            .w(px(112.0))
+                                            .px_3()
+                                            .py_2()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .rounded_md()
+                                            .cursor_text()
+                                            .border_1()
+                                            .border_color(rgb(if !encoder_thread_count_valid {
+                                                ERROR_COLOR
+                                            } else if encoder_thread_count_focused {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_COLOR
+                                            }))
+                                            .bg(rgb(PANEL_COLOR))
+                                            .font_family("JetBrains Mono")
+                                            .child(self.encoder_thread_count_input.clone())
+                                            .child(
+                                                div()
+                                                    .ml_2()
+                                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                                    .child("threads"),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_3()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("Preserve media streams"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(48.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_t_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child("Audio")
+                                    .child(
+                                        div()
+                                            .id("preserve-audio-toggle")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .on_click(cx.listener(Self::toggle_preserve_audio))
+                                            .child(if self.preserve_audio { "✓ Keep" } else { "Do not keep" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(48.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_t_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child("Subtitles")
+                                    .child(
+                                        div()
+                                            .id("preserve-subtitles-toggle")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .on_click(cx.listener(Self::toggle_preserve_subtitles))
+                                            .child(if self.preserve_subtitles { "✓ Keep" } else { "Do not keep" }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(48.0))
+                                    .px_4()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_t_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child("Metadata")
+                                    .child(
+                                        div()
+                                            .id("preserve-metadata-toggle")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .on_click(cx.listener(Self::toggle_preserve_metadata))
+                                            .child(if self.preserve_metadata { "✓ Keep" } else { "Do not keep" }),
+                                    ),
+                            )
+                            .when(self.encoder_preset_menu_open, |element| {
+                                element.child(
+                                    div()
+                                        .id("encoder-preset-options-settings")
+                                        .absolute()
+                                        .top(px(244.0))
+                                        .right(px(16.0))
+                                        .w(px(270.0))
+                                        .h(px(324.0))
+                                        .overflow_y_scroll()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER_STRONG_COLOR))
+                                        .bg(rgb(PANEL_COLOR))
+                                        .shadow_lg()
+                                        .children(encoder_preset_options.iter().copied().enumerate().map(
+                                            |(preset_index, preset)| {
+                                                let selected = preset == self.encoder_preset;
+                                                div()
+                                                    .id(("encoder-preset-option-settings", preset_index))
+                                                    .h(px(36.0))
+                                                    .px_3()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .cursor_pointer()
+                                                    .border_b_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .bg(rgb(if selected { SELECTED_COLOR } else { PANEL_COLOR }))
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.select_encoder_preset(preset, cx)
+                                                    }))
+                                                    .child(encoder_preset_label(preset))
+                                                    .child(if selected { "✓" } else { "" })
+                                            },
+                                        )),
+                                )
+                            })
+                            .when(self.h264_profile_menu_open, |element| {
+                                element.child(
+                                    div()
+                                        .id("h264-profile-options-settings")
+                                        .absolute()
+                                        .top(px(308.0))
+                                        .right(px(16.0))
+                                        .w(px(270.0))
+                                        .h(px(108.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER_STRONG_COLOR))
+                                        .bg(rgb(PANEL_COLOR))
+                                        .shadow_lg()
+                                        .children(H264_PROFILES.iter().copied().enumerate().map(|(profile_index, profile)| {
+                                            let selected = profile == self.h264_profile;
+                                            div()
+                                                .id(("h264-profile-option-settings", profile_index))
+                                                .h(px(36.0))
+                                                .px_3()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .cursor_pointer()
+                                                .border_b_1()
+                                                .border_color(rgb(BORDER_COLOR))
+                                                .bg(rgb(if selected { SELECTED_COLOR } else { PANEL_COLOR }))
+                                                .on_click(cx.listener(move |app, _, _, cx| {
+                                                    app.select_h264_profile(profile, cx)
+                                                }))
+                                                .child(h264_profile_label(profile))
+                                                .child(if selected { "✓" } else { "" })
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED_COLOR))
                             .child(if self.tray_controller.is_some() {
@@ -1388,6 +3475,7 @@ impl Render for InterpolateApp {
                     )
             } else {
                 div()
+                    .id("encode-scroll")
                     .flex_1()
                     .overflow_hidden()
                     .p_5()
@@ -1403,6 +3491,7 @@ impl Render for InterpolateApp {
                             .child(
                                 div()
                                     .flex_1()
+                                    .w_full()
                                     .flex()
                                     .flex_col()
                                     .child(
@@ -1414,6 +3503,62 @@ impl Render for InterpolateApp {
                                     )
                                     .child(
                                         div()
+                                            .mb_3()
+                                            .h(px(36.0))
+                                            .w_full()
+                                            .flex()
+                                            .items_end()
+                                            .border_b_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .bg(rgb(BACKGROUND_COLOR))
+                                            .children(
+                                                [
+                                                    (MainPageTab::Interpolation, "Interpolation"),
+                                                    (MainPageTab::Hardware, "Hardware"),
+                                                    (MainPageTab::Encoding, "Encoding"),
+                                                    (MainPageTab::Media, "Media"),
+                                                ]
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(tab_index, (tab, label))| {
+                                                    let selected = self.main_page_tab == tab;
+                                                    div()
+                                                        .id(("main-page-tab", tab_index))
+                                                        .h(px(36.0))
+                                                        .px_4()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .cursor_pointer()
+                                                        .border_1()
+                                                        .border_color(rgb(if selected {
+                                                            BORDER_COLOR
+                                                        } else {
+                                                            BACKGROUND_COLOR
+                                                        }))
+                                                        .bg(rgb(if selected {
+                                                            PANEL_COLOR
+                                                        } else {
+                                                            BACKGROUND_COLOR
+                                                        }))
+                                                        .text_color(rgb(if selected {
+                                                            TEXT_COLOR
+                                                        } else {
+                                                            TEXT_MUTED_COLOR
+                                                        }))
+                                                        .hover(|style| style.bg(rgb(PANEL_HOVER_COLOR)))
+                                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                                            app.select_main_page_tab(tab, cx)
+                                                        }))
+                                                        .child(label)
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .when(self.main_page_tab != MainPageTab::Interpolation, |element| {
+                                                element.hidden()
+                                            })
                                             .relative()
                                             .rounded_lg()
                                             .border_1()
@@ -1520,6 +3665,110 @@ impl Render for InterpolateApp {
                                                                     .ml_2()
                                                                     .text_color(rgb(TEXT_SUBTLE_COLOR))
                                                                     .child("FPS"),
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(64.0))
+                                                    .px_4()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .border_t_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(
+                                                        div().child("Video encoder").child(
+                                                            div()
+                                                                .mt_1()
+                                                                .text_xs()
+                                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                .child("Hardware acceleration is tested at startup"),
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("video-encoder-selector")
+                                                            .w(px(270.0))
+                                                            .px_3()
+                                                            .py_2()
+                                                            .rounded_md()
+                                                            .cursor_pointer()
+                                                            .border_1()
+                                                            .border_color(rgb(if self.video_encoder_menu_open {
+                                                                ACCENT_COLOR
+                                                            } else {
+                                                                BORDER_COLOR
+                                                            }))
+                                                            .bg(rgb(PANEL_COLOR))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .font_family("JetBrains Mono")
+                                                            .text_xs()
+                                                            .text_color(rgb(TEXT_MUTED_COLOR))
+                                                            .hover(|style| style.border_color(rgb(BORDER_STRONG_COLOR)))
+                                                            .on_click(cx.listener(Self::toggle_video_encoder_menu))
+                                                            .child(selected_video_encoder_label)
+                                                            .child(
+                                                                div()
+                                                                    .ml_2()
+                                                                    .text_color(rgb(TEXT_SUBTLE_COLOR))
+                                                                    .child(if self.video_encoder_menu_open { "⌃" } else { "⌄" }),
+                                                            ),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(64.0))
+                                                    .px_4()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .border_t_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(
+                                                        div().child("NVIDIA hardware decode").child(
+                                                            div()
+                                                                .mt_1()
+                                                                .text_xs()
+                                                                .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                .child(if nvdec_available {
+                                                                    "Optional NVDEC acceleration for video decoding"
+                                                                } else {
+                                                                    "Unavailable: NVIDIA FFmpeg decode support not detected"
+                                                                }),
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("nvdec-toggle")
+                                                            .w(px(40.0))
+                                                            .h(px(22.0))
+                                                            .p(px(2.0))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_start()
+                                                            .when(self.use_nvdec, |element| element.justify_end())
+                                                            .rounded_full()
+                                                            .cursor_pointer()
+                                                            .border_1()
+                                                            .border_color(rgb(if self.use_nvdec {
+                                                                ACCENT_COLOR
+                                                            } else {
+                                                                BORDER_STRONG_COLOR
+                                                            }))
+                                                            .bg(rgb(if self.use_nvdec {
+                                                                ACCENT_COLOR
+                                                            } else {
+                                                                BORDER_COLOR
+                                                            }))
+                                                            .on_click(cx.listener(Self::toggle_nvdec))
+                                                            .child(
+                                                                div()
+                                                                    .size(px(16.0))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(TEXT_COLOR)),
                                                             ),
                                                     ),
                                             )
@@ -1738,12 +3987,51 @@ impl Render for InterpolateApp {
                                                         ),
                                                 )
                                             })
+                                            .when(self.video_encoder_menu_open, |element| {
+                                                element.child(
+                                                    div()
+                                                        .id("video-encoder-options")
+                                                        .absolute()
+                                                        .top(px(180.0))
+                                                        .right(px(16.0))
+                                                        .w(px(270.0))
+                                                        .h(video_encoder_menu_height)
+                                                        .overflow_y_scroll()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(rgb(BORDER_STRONG_COLOR))
+                                                        .bg(rgb(PANEL_COLOR))
+                                                        .shadow_lg()
+                                                        .children(self.video_encoders.iter().enumerate().map(
+                                                            |(encoder_index, encoder)| {
+                                                                let selected = encoder_index == self.selected_video_encoder;
+                                                                div()
+                                                                    .id(("video-encoder-option", encoder_index))
+                                                                    .h(px(36.0))
+                                                                    .px_3()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .cursor_pointer()
+                                                                    .border_b_1()
+                                                                    .border_color(rgb(BORDER_COLOR))
+                                                                    .bg(rgb(if selected { SELECTED_COLOR } else { PANEL_COLOR }))
+                                                                    .hover(|style| style.bg(rgb(PANEL_HOVER_COLOR)))
+                                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                                        app.select_video_encoder(encoder_index, cx)
+                                                                    }))
+                                                                    .child(video_encoder_label(*encoder))
+                                                                    .child(if selected { "✓" } else { "" })
+                                                            },
+                                                        )),
+                                                )
+                                            })
                                             .when(self.gpu_menu_open, |element| {
                                                 element.child(
                                                     div()
                                                         .id("gpu-options")
                                                         .absolute()
-                                                        .top(px(180.0))
+                                                        .top(px(308.0))
                                                         .right(px(16.0))
                                                         .w(px(270.0))
                                                         .h(gpu_menu_height)
@@ -1795,7 +4083,16 @@ impl Render for InterpolateApp {
                                                         )),
                                                 )
                                             }),
-                                    ),
+                                    )
+                                    .when(self.main_page_tab == MainPageTab::Hardware, |element| {
+                                        element.child(self.render_hardware_tab(cx))
+                                    })
+                                    .when(self.main_page_tab == MainPageTab::Encoding, |element| {
+                                        element.child(self.render_encoding_tab(window, cx))
+                                    })
+                                    .when(self.main_page_tab == MainPageTab::Media, |element| {
+                                        element.child(self.render_media_tab(cx))
+                                    })
                             )
                             .child(
                                 div()
@@ -1978,8 +4275,8 @@ impl Render for InterpolateApp {
                                                         },
                                                     )),
                                             ),
-                                    ),
-                            ),
+                                    )
+                            )
                     )
                     .child(
                         div()
@@ -2091,6 +4388,7 @@ impl Render for InterpolateApp {
                                     .text_color(rgb(TEXT_MUTED_COLOR))
                                     .child(frame_label)
                                     .child(speed_label)
+                                    .child(stage_speed_label)
                                     .child(eta_label),
                             ),
                     )

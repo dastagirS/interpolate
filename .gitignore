@@ -1,6 +1,7 @@
 # Rust, native, and release build output
 /target/
 /dist/
+/runtime/
 *.o
 *.a
 *.so

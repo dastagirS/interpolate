@@ -1,7 +1,10 @@
 use std::{
     ffi::{CStr, c_char, c_float, c_int, c_uchar, c_uint},
-    path::Path,
+    io::{BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     ptr::NonNull,
+    time::Duration,
 };
 
 const BACKEND_ABI_VERSION: u32 = 2;
@@ -11,6 +14,101 @@ const RGB_CHANNEL_COUNT: usize = 3;
 const CPU_THREAD_COUNT_MIN: i32 = 1;
 const CPU_THREAD_COUNT_MAX: i32 = 16;
 const STATUS_OK: i32 = 0;
+const CUDA_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CUDA_FRAME_SIZE_MAX: usize = 128 * 1024 * 1024;
+const CUDA_WORKER_READY: &[u8; 4] = b"RIF1";
+const PYTORCH_MODEL_RELATIVE: &str = "models/rife-v4.25/flownet_v4.25.pkl";
+const PYTORCH_MODEL_ENVIRONMENT: &str = "INTERPOLATE_PYTORCH_MODEL";
+const PYTHON_EXECUTABLE_ENVIRONMENT: &str = "INTERPOLATE_PYTHON_EXECUTABLE";
+const PYTHON_EXECUTABLE_RELATIVE: &str = "runtime/python/bin/python3";
+const PYTORCH_WORKER_SOURCE: &str = include_str!("../scripts/pytorch_rife_worker.py");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceBackend {
+    VulkanNcnn,
+    CudaPytorchVapourSynth,
+}
+
+pub struct CudaInferenceStatus {
+    pub available: bool,
+    pub reason: String,
+}
+
+pub fn cuda_inference_status() -> CudaInferenceStatus {
+    let model_available = resolve_pytorch_model_path().is_some();
+    let dependency_status = python_executable().map_or_else(
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Python runtime not found",
+            ))
+        },
+        |python| {
+            Command::new(python)
+                .args([
+                    "-c",
+                    "import torch, vapoursynth, vsrife; raise SystemExit(0 if torch.cuda.is_available() else 1)",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        },
+    );
+    let (available, reason) = match (model_available, dependency_status) {
+        (false, _) => (
+            false,
+            format!("PyTorch RIFE model is missing at {PYTORCH_MODEL_RELATIVE}"),
+        ),
+        (true, Ok(status)) if status.success() => (
+            true,
+            "PyTorch CUDA with VapourSynth/vs-rife is available".to_owned(),
+        ),
+        (true, Ok(status)) => (
+            false,
+            format!("Python CUDA dependencies are unavailable (exit status {status})"),
+        ),
+        (true, Err(error)) => (
+            false,
+            format!("failed to probe Python CUDA dependencies: {error}"),
+        ),
+    };
+    assert!(!reason.is_empty(), "CUDA status reason must not be empty");
+    assert!(reason.len() < 256, "CUDA status reason must remain bounded");
+    CudaInferenceStatus { available, reason }
+}
+
+fn resolve_pytorch_model_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(PYTORCH_MODEL_ENVIRONMENT) {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let executable = std::env::current_exe().ok()?;
+    let executable_directory = executable.parent()?;
+    let candidates = [
+        executable_directory.join(PYTORCH_MODEL_RELATIVE),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(PYTORCH_MODEL_RELATIVE),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn python_executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(PYTHON_EXECUTABLE_ENVIRONMENT) {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let executable = std::env::current_exe().ok()?;
+    let executable_directory = executable.parent()?;
+    let bundled_path = executable_directory.join(PYTHON_EXECUTABLE_RELATIVE);
+    if bundled_path.is_file() {
+        return Some(bundled_path);
+    }
+    if cfg!(debug_assertions) {
+        return Some(PathBuf::from("python3"));
+    }
+    None
+}
+
 #[cfg(test)]
 const STATUS_INVALID_ARGUMENT: i32 = 1;
 
@@ -195,6 +293,196 @@ impl Backend {
             "row stride must remain RGB24"
         );
         Ok(())
+    }
+}
+
+pub struct CudaBackend {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    frame_size: usize,
+}
+
+impl CudaBackend {
+    pub fn create(width: u32, height: u32, gpu_index: i32) -> Result<Self, String> {
+        assert!(width > 0, "CUDA frame width must be positive");
+        assert!(height > 0, "CUDA frame height must be positive");
+        assert!(gpu_index >= 0, "CUDA GPU index must be non-negative");
+        let frame_size = usize::try_from(width)
+            .ok()
+            .and_then(|value| value.checked_mul(usize::try_from(height).ok()?))
+            .and_then(|value| value.checked_mul(RGB_CHANNEL_COUNT))
+            .ok_or_else(|| "CUDA frame size exceeds addressable memory".to_owned())?;
+        if frame_size > CUDA_FRAME_SIZE_MAX {
+            return Err("CUDA frame exceeds the safety limit".to_owned());
+        }
+        let model_path = resolve_pytorch_model_path()
+            .ok_or_else(|| "bundled PyTorch RIFE 4.25 model was not found".to_owned())?;
+        let width_text = width.to_string();
+        let height_text = height.to_string();
+        let gpu_text = gpu_index.to_string();
+        let python = python_executable()
+            .ok_or_else(|| "bundled Python runtime could not be located".to_owned())?;
+        let mut child = Command::new(python)
+            .args(["-u", "-c", PYTORCH_WORKER_SOURCE, "--width"])
+            .arg(&width_text)
+            .args(["--height"])
+            .arg(&height_text)
+            .args(["--gpu"])
+            .arg(&gpu_text)
+            .args(["--model"])
+            .arg(&model_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to start PyTorch RIFE worker: {error}"))?;
+        let Some(input) = child.stdin.take() else {
+            let _ = terminate_process(&mut child);
+            return Err("PyTorch RIFE worker stdin is unavailable".to_owned());
+        };
+        let Some(output) = child.stdout.take() else {
+            let _ = terminate_process(&mut child);
+            return Err("PyTorch RIFE worker stdout is unavailable".to_owned());
+        };
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut output = BufReader::new(output);
+            let mut ready = [0_u8; CUDA_WORKER_READY.len()];
+            let result = output
+                .read_exact(&mut ready)
+                .map(|()| (ready == *CUDA_WORKER_READY, output));
+            let _ = ready_sender.send(result);
+        });
+        let ready_result = match ready_receiver.recv_timeout(CUDA_WORKER_STARTUP_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = terminate_process(&mut child);
+                return Err("PyTorch RIFE worker startup timed out".to_owned());
+            }
+        };
+        let output = match ready_result {
+            Ok((true, output)) => output,
+            Ok((false, _)) => {
+                let _ = terminate_process(&mut child);
+                return Err("PyTorch RIFE worker returned an invalid handshake".to_owned());
+            }
+            Err(error) => {
+                let _ = terminate_process(&mut child);
+                return Err(format!(
+                    "PyTorch RIFE worker failed during startup: {error}"
+                ));
+            }
+        };
+        assert!(frame_size > 0, "CUDA frame size must remain positive");
+        Ok(Self {
+            child,
+            input,
+            output,
+            frame_size,
+        })
+    }
+
+    pub fn interpolate_rgb24(
+        &mut self,
+        frame_before: &[u8],
+        frame_after: &[u8],
+        width: u32,
+        height: u32,
+        timestep: f32,
+        frame_output: &mut [u8],
+    ) -> Result<(), String> {
+        assert!(width > 0, "CUDA frame width must be positive");
+        assert!(height > 0, "CUDA frame height must be positive");
+        let expected_size = usize::try_from(width)
+            .ok()
+            .and_then(|value| value.checked_mul(usize::try_from(height).ok()?))
+            .and_then(|value| value.checked_mul(RGB_CHANNEL_COUNT))
+            .ok_or_else(|| "CUDA frame size exceeds addressable memory".to_owned())?;
+        if self.frame_size != expected_size
+            || frame_before.len() != expected_size
+            || frame_after.len() != expected_size
+            || frame_output.len() != expected_size
+        {
+            return Err("CUDA worker frame dimensions changed during the job".to_owned());
+        }
+        if !timestep.is_finite() || !(0.0..1.0).contains(&timestep) {
+            return Err("CUDA worker timestep must be strictly between zero and one".to_owned());
+        }
+        self.input
+            .write_all(&timestep.to_le_bytes())
+            .and_then(|()| self.input.write_all(frame_before))
+            .and_then(|()| self.input.write_all(frame_after))
+            .and_then(|()| self.input.flush())
+            .map_err(|error| format!("failed to send frames to PyTorch RIFE worker: {error}"))?;
+        self.output.read_exact(frame_output).map_err(|error| {
+            format!("failed to receive frame from PyTorch RIFE worker: {error}")
+        })?;
+        assert_eq!(frame_output.len(), expected_size);
+        Ok(())
+    }
+}
+
+impl Drop for CudaBackend {
+    fn drop(&mut self) {
+        assert!(self.frame_size > 0, "CUDA frame size must remain positive");
+        let _ = terminate_process(&mut self.child);
+        assert!(
+            self.frame_size <= CUDA_FRAME_SIZE_MAX,
+            "CUDA frame must remain bounded"
+        );
+    }
+}
+
+fn terminate_process(child: &mut Child) -> Result<(), String> {
+    if child
+        .try_wait()
+        .map_err(|error| format!("failed to query worker: {error}"))?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|error| format!("failed to stop worker: {error}"))?;
+    }
+    child
+        .wait()
+        .map(|_| ())
+        .map_err(|error| format!("failed to reap worker: {error}"))
+}
+
+pub enum InferenceEngine {
+    Vulkan(Backend),
+    Cuda(CudaBackend),
+}
+
+impl InferenceEngine {
+    pub fn interpolate_rgb24(
+        &mut self,
+        frame_before: &[u8],
+        frame_after: &[u8],
+        width: u32,
+        height: u32,
+        timestep: f32,
+        frame_output: &mut [u8],
+    ) -> Result<(), String> {
+        match self {
+            Self::Vulkan(backend) => backend.interpolate_rgb24(
+                frame_before,
+                frame_after,
+                width,
+                height,
+                timestep,
+                frame_output,
+            ),
+            Self::Cuda(backend) => backend.interpolate_rgb24(
+                frame_before,
+                frame_after,
+                width,
+                height,
+                timestep,
+                frame_output,
+            ),
+        }
     }
 }
 

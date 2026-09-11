@@ -2,7 +2,7 @@ mod scheduler;
 
 pub use crate::cadence::{CadenceDiagnostics, ContentPreset};
 use crate::{
-    backend::Backend,
+    backend::{Backend, CudaBackend, InferenceBackend, InferenceEngine},
     cadence::{
         FrameDifference, is_confident_duplicate, is_smoothable_cadence_run,
         measure_frame_difference_rgb24,
@@ -22,7 +22,7 @@ use std::{
         mpsc::SyncSender,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const RGB_CHANNEL_COUNT: usize = 3;
@@ -30,7 +30,14 @@ const FRAME_SIZE_BYTES_MAX: usize = 128 * 1024 * 1024;
 const FRAME_DIMENSION_MAX: u32 = 16_384;
 const OUTPUT_FRAME_COUNT_MAX: u64 = 100_000_000;
 const TARGET_FPS_MAX: u32 = 480;
+const ENCODER_QUALITY_MAX: u8 = 51;
+const ENCODER_THREAD_COUNT_MAX: u8 = 16;
 const FFMPEG_THREAD_COUNT: &str = "2";
+const ENCODER_PROBE_WIDTH: &str = "256";
+const ENCODER_PROBE_HEIGHT: &str = "256";
+const ENCODER_PROBE_FRAME_COUNT: &str = "1";
+const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const ENCODER_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_DIAGNOSTIC_SIZE_BYTES_MAX: usize = 64 * 1024;
 const PROBE_DIAGNOSTIC_LINE_COUNT_MAX: usize = 200;
@@ -40,6 +47,46 @@ const PROCESS_OUTPUT_READ_COUNT_MAX: usize = 1_048_576;
 const SCENE_THRESHOLD_DEFAULT: f64 = 0.15;
 const MODEL_DIRECTORY_ENVIRONMENT: &str = "INTERPOLATE_MODEL_DIRECTORY";
 const MODEL_DIRECTORY_RELATIVE: &str = "share/interpolate/models/rife-v4.25";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoEncoder {
+    Automatic,
+    SoftwareH264,
+    NvidiaH264,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderPreset {
+    X264VeryFast,
+    X264Faster,
+    X264Fast,
+    X264Medium,
+    X264Slow,
+    X264Slower,
+    X264VerySlow,
+    X264Placebo,
+    NvidiaP1,
+    NvidiaP2,
+    NvidiaP3,
+    NvidiaP4,
+    NvidiaP5,
+    NvidiaP6,
+    NvidiaP7,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H264Profile {
+    Auto,
+    Main,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PerformanceDiagnostics {
+    pub inference_fps: f64,
+    pub decode_fps: f64,
+    pub encode_fps: f64,
+}
 
 #[derive(Clone)]
 pub struct JobConfiguration {
@@ -51,6 +98,16 @@ pub struct JobConfiguration {
     pub content_preset: ContentPreset,
     pub scene_detection: bool,
     pub use_uhd_mode: bool,
+    pub use_nvdec: bool,
+    pub inference_backend: InferenceBackend,
+    pub video_encoder: VideoEncoder,
+    pub encoder_preset: EncoderPreset,
+    pub quality_level: u8,
+    pub h264_profile: H264Profile,
+    pub encoder_thread_count: u8,
+    pub preserve_audio: bool,
+    pub preserve_subtitles: bool,
+    pub preserve_metadata: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +119,7 @@ pub enum JobUpdate {
         processing_fps: f64,
         progress: f32,
         cadence_diagnostics: CadenceDiagnostics,
+        performance: PerformanceDiagnostics,
     },
     Completed {
         path: PathBuf,
@@ -139,6 +197,114 @@ pub fn probe_video(input_path: &Path) -> Result<VideoMetadata, String> {
     );
     assert!(FRAME_DIMENSION_MAX > 0, "dimension limit must be positive");
     probe_video_logged(input_path, None)
+}
+
+pub fn available_video_encoders() -> Vec<VideoEncoder> {
+    assert!(
+        !ENCODER_PROBE_WIDTH.is_empty(),
+        "encoder probe width must be set"
+    );
+    assert!(
+        !ENCODER_PROBE_HEIGHT.is_empty(),
+        "encoder probe height must be set"
+    );
+    assert!(
+        ENCODER_PROBE_TIMEOUT > Duration::ZERO,
+        "encoder probe timeout must be positive"
+    );
+    assert!(
+        ENCODER_PROBE_POLL_INTERVAL > Duration::ZERO,
+        "encoder probe poll interval must be positive"
+    );
+    let mut encoders = Vec::with_capacity(3);
+    let software_available = encoder_is_available("libx264");
+    let nvidia_available = encoder_is_available("h264_nvenc");
+    if software_available || nvidia_available {
+        encoders.push(VideoEncoder::Automatic);
+    }
+    if software_available {
+        encoders.push(VideoEncoder::SoftwareH264);
+    }
+    if nvidia_available {
+        encoders.push(VideoEncoder::NvidiaH264);
+    }
+    assert!(encoders.len() <= 3, "encoder list must remain bounded");
+    encoders
+}
+
+fn encoder_is_available(encoder_name: &str) -> bool {
+    assert!(!encoder_name.is_empty(), "encoder name must not be empty");
+    assert!(encoder_name.len() < 64, "encoder name must remain bounded");
+    let available = encoder_is_available_for_gpu(encoder_name, None);
+    assert!(
+        !encoder_name.is_empty(),
+        "encoder name must remain non-empty"
+    );
+    assert!(encoder_name.len() < 64, "encoder name must remain bounded");
+    available
+}
+
+fn encoder_is_available_for_gpu(encoder_name: &str, gpu_index: Option<i32>) -> bool {
+    assert!(!encoder_name.is_empty(), "encoder name must not be empty");
+    assert!(encoder_name.len() < 64, "encoder name must remain bounded");
+    assert!(
+        gpu_index.is_none_or(|index| index >= 0),
+        "GPU index must be non-negative"
+    );
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg(format!(
+            "color=c=black:s={ENCODER_PROBE_WIDTH}x{ENCODER_PROBE_HEIGHT}:r=1"
+        ))
+        .args(["-frames:v", ENCODER_PROBE_FRAME_COUNT, "-c:v"])
+        .arg(encoder_name);
+    if let Some(gpu_index) = gpu_index {
+        command.args(["-gpu"]).arg(gpu_index.to_string());
+    }
+    let mut child = match command
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + ENCODER_PROBE_TIMEOUT;
+    let mut available = false;
+    for _ in 0..=ENCODER_PROBE_TIMEOUT.as_millis() / ENCODER_PROBE_POLL_INTERVAL.as_millis() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                available = status.success();
+                break;
+            }
+            Ok(None) => thread::sleep(ENCODER_PROBE_POLL_INTERVAL),
+            Err(_) => {
+                let _ = terminate_child(&mut child);
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = terminate_child(&mut child);
+            break;
+        }
+    }
+    assert!(
+        !encoder_name.is_empty(),
+        "encoder name must remain non-empty"
+    );
+    assert!(encoder_name.len() < 64, "encoder name must remain bounded");
+    available
 }
 
 fn probe_video_logged(input_path: &Path, log: Option<&JobLog>) -> Result<VideoMetadata, String> {
@@ -555,13 +721,22 @@ fn run_job_inner(
         return Err("job cancelled".to_owned());
     }
 
-    send_update(updates, JobUpdate::Phase("Initializing RIFE 4.25"));
-    let model_directory = resolve_model_directory()?;
-    let mut backend = Backend::create(
-        &model_directory,
-        configuration.gpu_index,
-        configuration.use_uhd_mode,
-    )?;
+    send_update(updates, JobUpdate::Phase("Initializing inference backend"));
+    let mut backend = match configuration.inference_backend {
+        InferenceBackend::VulkanNcnn => {
+            let model_directory = resolve_model_directory()?;
+            InferenceEngine::Vulkan(Backend::create(
+                &model_directory,
+                configuration.gpu_index,
+                configuration.use_uhd_mode,
+            )?)
+        }
+        InferenceBackend::CudaPytorchVapourSynth => InferenceEngine::Cuda(CudaBackend::create(
+            metadata.width,
+            metadata.height,
+            configuration.gpu_index,
+        )?),
+    };
 
     let partial_path = partial_output_path(&configuration.output_path)?;
     if partial_path.exists() {
@@ -571,7 +746,29 @@ fn run_job_inner(
 
     send_update(updates, JobUpdate::Phase("Starting media pipeline"));
     let mut decoder = spawn_decoder(configuration, &metadata, log)?;
-    let mut encoder = match spawn_encoder(configuration, &metadata, &partial_path, log) {
+    let mut encoder_configuration = configuration.clone();
+    let encoder_result = match spawn_encoder(configuration, &metadata, &partial_path, log) {
+        Ok(encoder) => Ok(encoder),
+        Err(error)
+            if matches!(
+                configuration.video_encoder,
+                VideoEncoder::Automatic | VideoEncoder::NvidiaH264
+            ) =>
+        {
+            send_update(
+                updates,
+                JobUpdate::Phase("NVENC unavailable; falling back to CPU H.264"),
+            );
+            encoder_configuration.video_encoder = VideoEncoder::SoftwareH264;
+            spawn_encoder(&encoder_configuration, &metadata, &partial_path, log).map_err(
+                |fallback_error| {
+                    format!("NVENC failed: {error}; CPU H.264 fallback failed: {fallback_error}")
+                },
+            )
+        }
+        Err(error) => Err(error),
+    };
+    let mut encoder = match encoder_result {
         Ok(encoder) => encoder,
         Err(error) => {
             let terminate_result = terminate_child(&mut decoder.child);
@@ -689,6 +886,27 @@ fn validate_configuration(configuration: &JobConfiguration) -> Result<(), String
     {
         return Err(format!("target FPS must be between 1 and {TARGET_FPS_MAX}"));
     }
+    if configuration.quality_level > ENCODER_QUALITY_MAX {
+        return Err(format!(
+            "quality must be between 0 and {ENCODER_QUALITY_MAX}"
+        ));
+    }
+    if configuration.encoder_thread_count > ENCODER_THREAD_COUNT_MAX {
+        return Err(format!(
+            "encoder threads must be between 0 and {ENCODER_THREAD_COUNT_MAX}"
+        ));
+    }
+    assert!(matches!(
+        configuration.inference_backend,
+        InferenceBackend::VulkanNcnn | InferenceBackend::CudaPytorchVapourSynth
+    ));
+    if matches!(
+        configuration.inference_backend,
+        InferenceBackend::CudaPytorchVapourSynth
+    ) && configuration.gpu_index < 0
+    {
+        return Err("CUDA inference GPU index must be non-negative".to_owned());
+    }
     assert_ne!(
         configuration.input_path, configuration.output_path,
         "validated paths must differ"
@@ -742,30 +960,27 @@ fn spawn_decoder(
 ) -> Result<MediaChild, String> {
     assert!(metadata.width > 0, "decoder width must be positive");
     assert!(metadata.height > 0, "decoder height must be positive");
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-nostdin",
-            "-v",
-            "error",
-            "-threads",
-            FFMPEG_THREAD_COUNT,
-            "-i",
-        ])
-        .arg(&configuration.input_path)
-        .args([
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-dn",
-            "-fps_mode",
-            "passthrough",
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ])
+    let mut command = Command::new("ffmpeg");
+    command.args(["-nostdin", "-v", "error", "-threads", FFMPEG_THREAD_COUNT]);
+    if configuration.use_nvdec {
+        command.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]);
+    }
+    command.arg("-i").arg(&configuration.input_path).args([
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-fps_mode",
+        "passthrough",
+    ]);
+    if configuration.use_nvdec {
+        command.args(["-vf", "hwdownload,format=rgb24"]);
+    } else {
+        command.args(["-pix_fmt", "rgb24"]);
+    }
+    let mut child = command
+        .args(["-f", "rawvideo", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -802,6 +1017,72 @@ fn spawn_decoder(
     })
 }
 
+fn resolve_video_encoder(configuration: &JobConfiguration) -> VideoEncoder {
+    assert!(
+        configuration.gpu_index >= 0,
+        "encoder GPU index must be non-negative"
+    );
+    assert!(matches!(
+        configuration.video_encoder,
+        VideoEncoder::Automatic | VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
+    ));
+    let resolved_encoder = match configuration.video_encoder {
+        VideoEncoder::Automatic
+            if encoder_is_available_for_gpu("h264_nvenc", Some(configuration.gpu_index)) =>
+        {
+            VideoEncoder::NvidiaH264
+        }
+        VideoEncoder::Automatic | VideoEncoder::SoftwareH264 => VideoEncoder::SoftwareH264,
+        VideoEncoder::NvidiaH264 => VideoEncoder::NvidiaH264,
+    };
+    assert!(!matches!(resolved_encoder, VideoEncoder::Automatic));
+    assert!(matches!(
+        resolved_encoder,
+        VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
+    ));
+    resolved_encoder
+}
+
+fn encoder_preset_argument(encoder: VideoEncoder, preset: EncoderPreset) -> &'static str {
+    assert!(matches!(
+        encoder,
+        VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
+    ));
+    let argument = match encoder {
+        VideoEncoder::SoftwareH264 => match preset {
+            EncoderPreset::X264VeryFast => "veryfast",
+            EncoderPreset::X264Faster => "faster",
+            EncoderPreset::X264Fast => "fast",
+            EncoderPreset::X264Medium => "medium",
+            EncoderPreset::X264Slow => "slow",
+            EncoderPreset::X264Slower => "slower",
+            EncoderPreset::X264VerySlow => "veryslow",
+            EncoderPreset::X264Placebo => "placebo",
+            _ => "medium",
+        },
+        VideoEncoder::NvidiaH264 => match preset {
+            EncoderPreset::NvidiaP1 => "p1",
+            EncoderPreset::NvidiaP2 => "p2",
+            EncoderPreset::NvidiaP3 => "p3",
+            EncoderPreset::NvidiaP4 => "p4",
+            EncoderPreset::NvidiaP5 => "p5",
+            EncoderPreset::NvidiaP6 => "p6",
+            EncoderPreset::NvidiaP7 => "p7",
+            _ => "p5",
+        },
+        VideoEncoder::Automatic => unreachable!("automatic encoder must be resolved"),
+    };
+    assert!(
+        !argument.is_empty(),
+        "encoder preset argument must not be empty"
+    );
+    assert!(
+        argument.len() <= 8,
+        "encoder preset argument must remain bounded"
+    );
+    argument
+}
+
 fn spawn_encoder(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
@@ -818,7 +1099,64 @@ fn spawn_encoder(
         "{}/{}",
         configuration.target_fps_num, configuration.target_fps_den
     );
-    let mut child = Command::new("ffmpeg")
+    assert!(
+        configuration.quality_level <= ENCODER_QUALITY_MAX,
+        "quality must remain bounded"
+    );
+    assert!(
+        configuration.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
+        "encoder threads must remain bounded"
+    );
+    let effective_video_encoder = resolve_video_encoder(configuration);
+    if effective_video_encoder == VideoEncoder::NvidiaH264
+        && !encoder_is_available_for_gpu("h264_nvenc", Some(configuration.gpu_index))
+    {
+        return Err(format!(
+            "NVIDIA NVENC is unavailable on GPU {}",
+            configuration.gpu_index
+        ));
+    }
+    let encoder_preset =
+        encoder_preset_argument(effective_video_encoder, configuration.encoder_preset);
+    let quality_argument = configuration.quality_level.to_string();
+    let mut encoder_arguments = vec![
+        match effective_video_encoder {
+            VideoEncoder::SoftwareH264 => "libx264",
+            VideoEncoder::NvidiaH264 => "h264_nvenc",
+            VideoEncoder::Automatic => unreachable!("automatic encoder must be resolved"),
+        }
+        .to_owned(),
+        "-preset".to_owned(),
+        encoder_preset.to_owned(),
+    ];
+    match effective_video_encoder {
+        VideoEncoder::SoftwareH264 => {
+            encoder_arguments.extend(["-crf".to_owned(), quality_argument])
+        }
+        VideoEncoder::NvidiaH264 => encoder_arguments.extend([
+            "-rc".to_owned(),
+            "vbr".to_owned(),
+            "-cq".to_owned(),
+            quality_argument,
+            "-b:v".to_owned(),
+            "0".to_owned(),
+            "-gpu".to_owned(),
+            configuration.gpu_index.to_string(),
+        ]),
+        VideoEncoder::Automatic => unreachable!("automatic encoder must be resolved"),
+    }
+    if configuration.h264_profile != H264Profile::Auto {
+        encoder_arguments.extend([
+            "-profile:v".to_owned(),
+            match configuration.h264_profile {
+                H264Profile::Auto => unreachable!("automatic profile is handled above"),
+                H264Profile::Main => "main".to_owned(),
+                H264Profile::High => "high".to_owned(),
+            },
+        ]);
+    }
+    let mut command = Command::new("ffmpeg");
+    command
         .args([
             "-nostdin",
             "-v",
@@ -837,32 +1175,30 @@ fn spawn_encoder(
         .arg(frame_rate)
         .args(["-i", "pipe:0", "-i"])
         .arg(&configuration.input_path)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-map",
-            "1:s?",
-            "-map_metadata",
-            "1",
-            "-map_chapters",
-            "1",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-threads",
-            FFMPEG_THREAD_COUNT,
-            "-c:a",
-            "copy",
-            "-c:s",
-            "copy",
-        ])
+        .args(["-map", "0:v:0"]);
+    if configuration.preserve_audio {
+        command.args(["-map", "1:a?"]);
+    }
+    if configuration.preserve_subtitles {
+        command.args(["-map", "1:s?"]);
+    }
+    if configuration.preserve_metadata {
+        command.args(["-map_metadata", "1", "-map_chapters", "1"]);
+    }
+    command.args(["-c:v"]).args(&encoder_arguments);
+    command.args(["-pix_fmt", "yuv420p"]);
+    if configuration.encoder_thread_count > 0 {
+        command
+            .args(["-threads"])
+            .arg(configuration.encoder_thread_count.to_string());
+    }
+    if configuration.preserve_audio {
+        command.args(["-c:a", "copy"]);
+    }
+    if configuration.preserve_subtitles {
+        command.args(["-c:s", "copy"]);
+    }
+    let mut child = command
         .arg(partial_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -905,7 +1241,7 @@ fn process_frames(
     metadata: &VideoMetadata,
     cancelled: &AtomicBool,
     updates: &SyncSender<JobUpdate>,
-    backend: &mut Backend,
+    backend: &mut InferenceEngine,
     decoder: &mut Child,
     encoder: &mut Child,
 ) -> Result<CadenceDiagnostics, String> {
@@ -925,7 +1261,10 @@ fn process_frames(
         .ok_or_else(|| "encoder input pipe is unavailable".to_owned())?;
     let mut frame_anchor = vec![0_u8; frame_size];
     let mut frame_candidate = vec![0_u8; frame_size];
-    if !read_frame(&mut decoder_output, &mut frame_anchor)? {
+    let anchor_read_started_at = Instant::now();
+    let anchor_available = read_frame(&mut decoder_output, &mut frame_anchor)?;
+    let anchor_read_elapsed = anchor_read_started_at.elapsed();
+    if !anchor_available {
         return Err("decoder produced no video frames".to_owned());
     }
 
@@ -938,6 +1277,7 @@ fn process_frames(
         &mut encoder_input,
         frame_size,
     );
+    scheduler.record_decode(anchor_read_elapsed);
     let anime_mode = configuration.content_preset == ContentPreset::Anime;
     let scene_detection = configuration.scene_detection || anime_mode;
     let mut anchor_index = 0_u64;
@@ -963,6 +1303,7 @@ fn process_frames(
                 "source exceeds the {OUTPUT_FRAME_COUNT_MAX}-frame safety limit"
             ));
         }
+        let candidate_read_started_at = Instant::now();
         let has_candidate = read_frame(&mut decoder_output, &mut frame_candidate)?;
         if !has_candidate {
             let source_index_end = candidate_index;
@@ -975,6 +1316,7 @@ fn process_frames(
             )?;
             break;
         }
+        scheduler.record_decode(candidate_read_started_at.elapsed());
 
         let difference = if anime_mode || scene_detection {
             measure_frame_difference_rgb24(
@@ -1423,6 +1765,16 @@ mod tests {
             content_preset: ContentPreset::Movie,
             scene_detection: true,
             use_uhd_mode: false,
+            use_nvdec: false,
+            inference_backend: InferenceBackend::VulkanNcnn,
+            video_encoder: VideoEncoder::SoftwareH264,
+            encoder_preset: EncoderPreset::X264Medium,
+            quality_level: 18,
+            h264_profile: H264Profile::Auto,
+            encoder_thread_count: 2,
+            preserve_audio: true,
+            preserve_subtitles: true,
+            preserve_metadata: true,
         };
         assert!(validate_target_fps(&configuration, &metadata).is_ok());
         configuration.target_fps_num = 23;
@@ -1447,6 +1799,16 @@ mod tests {
             content_preset: ContentPreset::Movie,
             scene_detection: true,
             use_uhd_mode: false,
+            use_nvdec: false,
+            inference_backend: InferenceBackend::VulkanNcnn,
+            video_encoder: VideoEncoder::SoftwareH264,
+            encoder_preset: EncoderPreset::X264Medium,
+            quality_level: 18,
+            h264_profile: H264Profile::Auto,
+            encoder_thread_count: 2,
+            preserve_audio: true,
+            preserve_subtitles: true,
+            preserve_metadata: true,
         };
         assert!(validate_configuration(&configuration).is_ok());
         configuration.output_path = input_path.clone();
@@ -1536,6 +1898,16 @@ mod tests {
             content_preset: ContentPreset::Anime,
             scene_detection: true,
             use_uhd_mode: false,
+            use_nvdec: false,
+            inference_backend: InferenceBackend::VulkanNcnn,
+            video_encoder: VideoEncoder::SoftwareH264,
+            encoder_preset: EncoderPreset::X264Medium,
+            quality_level: 18,
+            h264_profile: H264Profile::Auto,
+            encoder_thread_count: 2,
+            preserve_audio: true,
+            preserve_subtitles: true,
+            preserve_metadata: true,
         };
         let cancelled_output_path =
             PathBuf::from(format!("/tmp/interpolate-cancelled-{process_id}.mkv"));

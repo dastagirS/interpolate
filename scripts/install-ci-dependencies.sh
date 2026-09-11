@@ -2,7 +2,7 @@
 set -eu
 
 PACKAGE_COUNT_MAX=32
-package_count=21
+package_count=23
 
 test "$package_count" -gt 0
 test "$package_count" -le "$PACKAGE_COUNT_MAX"
@@ -35,6 +35,8 @@ sudo apt-get install --yes --no-install-recommends \
     libxkbcommon-x11-dev \
     mesa-vulkan-drivers \
     pkg-config \
+    python3-pip \
+    python3-venv \
     vulkan-tools
 
 test -x /usr/bin/ffmpeg

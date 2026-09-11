@@ -108,6 +108,11 @@ jobs:
           test -x target/release/interpolate
           test -s target/release/interpolate
 
+      - name: Prepare bundled CUDA Python runtime
+        env:
+          INTERPOLATE_CUDA_RUNTIME_ROOT: runtime/python
+        run: scripts/build-cuda-runtime.sh
+
       - name: Package release
         run: |
           set -euo pipefail
@@ -118,6 +123,7 @@ jobs:
 
           mkdir -p \
             "$package_root/models/rife-v4.25" \
+            "$package_root/runtime" \
             "$package_root/share/applications" \
             artifacts
           install -m 0755 target/release/interpolate "$package_root/interpolate"
@@ -127,9 +133,14 @@ jobs:
             "$package_root/models/rife-v4.25/flownet.param"
           install -m 0644 models/rife-v4.25/flownet.bin \
             "$package_root/models/rife-v4.25/flownet.bin"
+          install -m 0644 models/rife-v4.25/flownet_v4.25.pkl \
+            "$package_root/models/rife-v4.25/flownet_v4.25.pkl"
+          cp -a runtime/python "$package_root/runtime/python"
           install -m 0644 README.md LICENSE "$package_root/"
 
           test -x "$package_root/interpolate"
+          test -x "$package_root/runtime/python/bin/python3"
+          "$package_root/runtime/python/bin/python3" -c 'import torch, vapoursynth, vsrife; assert isinstance(torch.cuda.is_available(), bool)'
           grep -Fq 'Terminal=false' "$package_root/share/applications/interpolate.desktop"
           if head -c 2 "$package_root/interpolate" | grep -q '^#!'; then
             echo 'Release launcher must be the GUI executable, not a shell script.' >&2

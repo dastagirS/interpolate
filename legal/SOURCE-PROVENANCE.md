@@ -23,6 +23,7 @@ Model checksums:
 ```text
 6ba231fb00e4ae82b120f938d9b2df91db32fbf322bd110f29450efaf61848d6  flownet.param
 10de487a095e61cb2971c39e3b5e17005a70fba6201c77fb96e063f4423b583f  flownet.bin
+6615790efd627772917205db291f51cd392528a157ecbb2ecaeec3bff8eb6de2  flownet_v4.25.pkl
 ```
 
 Local compatibility change:
@@ -30,4 +31,10 @@ Local compatibility change:
 - FP16 storage remains enabled.
 - Legacy Vulkan pack8 is disabled because the pinned modern ncnn shader interface no longer defines the old RIFE port's pack8 arithmetic helpers. Pack1/pack4 Vulkan paths are used instead.
 
-The converted model still requires golden-frame comparison against the PyTorch `vsrife` RIFE 4.25 implementation before declaring pixel-level parity.
+The PyTorch model is `flownet_v4.25.pkl` from the `HolyWu/vs-rife` model release:
+
+```text
+https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl
+```
+
+The model is used by the optional PyTorch/VapourSynth backend with automatic model download disabled. The converted model still requires golden-frame comparison against the PyTorch `vsrife` RIFE 4.25 implementation before declaring pixel-level parity.

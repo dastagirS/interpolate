@@ -6,15 +6,18 @@ REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 MODEL_DIRECTORY="$REPOSITORY_ROOT/models/rife-v4.25"
 PARAMETER_SHA256="6ba231fb00e4ae82b120f938d9b2df91db32fbf322bd110f29450efaf61848d6"
 WEIGHTS_SHA256="10de487a095e61cb2971c39e3b5e17005a70fba6201c77fb96e063f4423b583f"
+PYTORCH_WEIGHTS_SHA256="6615790efd627772917205db291f51cd392528a157ecbb2ecaeec3bff8eb6de2"
 SCRIPT_COUNT_MAX=32
 
 cd "$REPOSITORY_ROOT"
 
 test -s "$MODEL_DIRECTORY/flownet.param"
 test -s "$MODEL_DIRECTORY/flownet.bin"
-printf '%s  %s\n%s  %s\n' \
+test -s "$MODEL_DIRECTORY/flownet_v4.25.pkl"
+printf '%s  %s\n%s  %s\n%s  %s\n' \
     "$PARAMETER_SHA256" "$MODEL_DIRECTORY/flownet.param" \
     "$WEIGHTS_SHA256" "$MODEL_DIRECTORY/flownet.bin" \
+    "$PYTORCH_WEIGHTS_SHA256" "$MODEL_DIRECTORY/flownet_v4.25.pkl" \
     | sha256sum --check --strict
 
 test -s Cargo.lock
@@ -30,6 +33,7 @@ grep -Fq '/scripts/install-ci-dependencies.sh @dastagirS' .github/CODEOWNERS
 grep -Fq '/scripts/configure-ci-vulkan.sh @dastagirS' .github/CODEOWNERS
 grep -Fq "$PARAMETER_SHA256" legal/SOURCE-PROVENANCE.md
 grep -Fq "$WEIGHTS_SHA256" legal/SOURCE-PROVENANCE.md
+grep -Fq "$PYTORCH_WEIGHTS_SHA256" legal/SOURCE-PROVENANCE.md
 
 if [ -e plan.md ] || git ls-files --error-unmatch plan.md >/dev/null 2>&1; then
     echo 'obsolete plan.md must not exist or be tracked' >&2
