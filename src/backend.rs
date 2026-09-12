@@ -304,10 +304,17 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
-    pub fn create(width: u32, height: u32, gpu_index: i32) -> Result<Self, String> {
+    pub fn create(
+        width: u32,
+        height: u32,
+        gpu_index: i32,
+        use_half_scale: bool,
+    ) -> Result<Self, String> {
         assert!(width > 0, "CUDA frame width must be positive");
         assert!(height > 0, "CUDA frame height must be positive");
         assert!(gpu_index >= 0, "CUDA GPU index must be non-negative");
+        assert!(width <= 16_384, "CUDA frame width must remain bounded");
+        assert!(height <= 16_384, "CUDA frame height must remain bounded");
         let frame_size = usize::try_from(width)
             .ok()
             .and_then(|value| value.checked_mul(usize::try_from(height).ok()?))
@@ -323,7 +330,8 @@ impl CudaBackend {
         let gpu_text = gpu_index.to_string();
         let python = python_executable()
             .ok_or_else(|| "bundled Python runtime could not be located".to_owned())?;
-        let mut child = Command::new(python)
+        let mut command = Command::new(python);
+        command
             .args(["-u", "-c", PYTORCH_WORKER_SOURCE, "--width"])
             .arg(&width_text)
             .args(["--height"])
@@ -331,7 +339,11 @@ impl CudaBackend {
             .args(["--gpu"])
             .arg(&gpu_text)
             .args(["--model"])
-            .arg(&model_path)
+            .arg(&model_path);
+        if use_half_scale {
+            command.arg("--half-scale");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -27,7 +27,13 @@ use std::{
 
 const RGB_CHANNEL_COUNT: usize = 3;
 const FRAME_SIZE_BYTES_MAX: usize = 128 * 1024 * 1024;
+const FRAME_BUFFER_COUNT: u64 = 3;
 const FRAME_DIMENSION_MAX: u32 = 16_384;
+const MEMORY_CONSTRAINED_AVAILABLE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const MEMORY_SAFETY_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CGROUP_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
+const CGROUP_MEMORY_CURRENT_PATH: &str = "/sys/fs/cgroup/memory.current";
+const PROC_MEMORY_INFO_PATH: &str = "/proc/meminfo";
 const OUTPUT_FRAME_COUNT_MAX: u64 = 100_000_000;
 const TARGET_FPS_MAX: u32 = 480;
 const ENCODER_QUALITY_MAX: u8 = 51;
@@ -125,7 +131,9 @@ pub enum JobUpdate {
         path: PathBuf,
         cadence_diagnostics: CadenceDiagnostics,
     },
-    Cancelled,
+    Cancelled {
+        partial_path: Option<PathBuf>,
+    },
     Failed(String),
 }
 
@@ -582,7 +590,11 @@ pub fn run_job(
             path: configuration.output_path.clone(),
             cadence_diagnostics,
         },
-        Err(_) if cancelled.load(Ordering::Acquire) => JobUpdate::Cancelled,
+        Err(_) if cancelled.load(Ordering::Acquire) => JobUpdate::Cancelled {
+            partial_path: partial_output_path(&configuration.output_path)
+                .ok()
+                .filter(|path| path.is_file()),
+        },
         Err(error) => JobUpdate::Failed(error),
     };
     let _ = updates.send(terminal_update);
@@ -720,6 +732,15 @@ fn run_job_inner(
     if cancelled.load(Ordering::Acquire) {
         return Err("job cancelled".to_owned());
     }
+    let (effective_configuration, memory_constrained) =
+        adapt_configuration_for_memory(configuration, &metadata)?;
+    if memory_constrained {
+        send_update(
+            updates,
+            JobUpdate::Phase("Using low-memory processing mode"),
+        );
+    }
+    let configuration = effective_configuration;
 
     send_update(updates, JobUpdate::Phase("Initializing inference backend"));
     let mut backend = match configuration.inference_backend {
@@ -735,6 +756,7 @@ fn run_job_inner(
             metadata.width,
             metadata.height,
             configuration.gpu_index,
+            configuration.use_uhd_mode,
         )?),
     };
 
@@ -745,9 +767,9 @@ fn run_job_inner(
     }
 
     send_update(updates, JobUpdate::Phase("Starting media pipeline"));
-    let mut decoder = spawn_decoder(configuration, &metadata, log)?;
+    let mut decoder = spawn_decoder(&configuration, &metadata, log)?;
     let mut encoder_configuration = configuration.clone();
-    let encoder_result = match spawn_encoder(configuration, &metadata, &partial_path, log) {
+    let encoder_result = match spawn_encoder(&configuration, &metadata, &partial_path, log) {
         Ok(encoder) => Ok(encoder),
         Err(error)
             if matches!(
@@ -787,7 +809,7 @@ fn run_job_inner(
     };
 
     let cadence_diagnostics = match process_frames(
-        configuration,
+        &configuration,
         &metadata,
         cancelled,
         updates,
@@ -802,15 +824,15 @@ fn run_job_inner(
             let decoder_log_result = finish_log_worker(&mut decoder);
             let encoder_log_result = finish_log_worker(&mut encoder);
             let was_cancelled = cancelled.load(Ordering::Acquire);
-            if was_cancelled {
-                let _ = fs::remove_file(&partial_path);
-            }
             let mut combined_error = error;
-            if !was_cancelled && partial_path.exists() {
+            if partial_path.exists() {
                 combined_error.push_str(&format!(
                     "; recoverable partial output remains at {}",
                     partial_path.display()
                 ));
+            }
+            if was_cancelled {
+                combined_error.push_str("; encoded frames were preserved");
             }
             if let Err(terminate_error) = decoder_terminate_result {
                 combined_error.push_str(&format!("; decoder cleanup failed: {terminate_error}"));
@@ -1522,6 +1544,118 @@ fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
     left
 }
 
+fn adapt_configuration_for_memory(
+    configuration: &JobConfiguration,
+    metadata: &VideoMetadata,
+) -> Result<(JobConfiguration, bool), String> {
+    assert!(metadata.width > 0, "memory policy width must be positive");
+    assert!(metadata.height > 0, "memory policy height must be positive");
+    let frame_size = checked_frame_size(metadata.width, metadata.height)?;
+    let frame_buffer_bytes = u64::try_from(frame_size)
+        .ok()
+        .and_then(|size| size.checked_mul(FRAME_BUFFER_COUNT))
+        .ok_or_else(|| "memory policy frame buffers exceed addressable memory".to_owned())?;
+    let available_bytes = available_memory_bytes()?;
+    let normal_backend_reserve = match configuration.inference_backend {
+        InferenceBackend::VulkanNcnn => MEMORY_SAFETY_RESERVE_BYTES / 2,
+        InferenceBackend::CudaPytorchVapourSynth => MEMORY_SAFETY_RESERVE_BYTES,
+    };
+    let normal_required_bytes = frame_buffer_bytes
+        .checked_add(normal_backend_reserve)
+        .ok_or_else(|| "normal memory budget overflowed".to_owned())?;
+    let memory_constrained = available_bytes < MEMORY_CONSTRAINED_AVAILABLE_BYTES
+        || available_bytes < normal_required_bytes;
+    if !memory_constrained {
+        assert!(available_bytes >= normal_required_bytes);
+        return Ok((configuration.clone(), false));
+    }
+
+    let constrained_required_bytes = frame_buffer_bytes
+        .checked_add(MEMORY_SAFETY_RESERVE_BYTES / 2)
+        .ok_or_else(|| "constrained memory budget overflowed".to_owned())?;
+    if available_bytes < constrained_required_bytes {
+        return Err(format!(
+            "not enough available memory for a safe job: {} MiB available, {} MiB required",
+            available_bytes / 1024 / 1024,
+            constrained_required_bytes / 1024 / 1024
+        ));
+    }
+    let mut constrained_configuration = configuration.clone();
+    constrained_configuration.use_uhd_mode = true;
+    constrained_configuration.use_nvdec = false;
+    constrained_configuration.encoder_thread_count = 1;
+    assert!(constrained_configuration.use_uhd_mode);
+    assert!(!constrained_configuration.use_nvdec);
+    Ok((constrained_configuration, true))
+}
+
+fn available_memory_bytes() -> Result<u64, String> {
+    assert!(
+        !PROC_MEMORY_INFO_PATH.is_empty(),
+        "memory info path must be set"
+    );
+    assert!(
+        !CGROUP_MEMORY_MAX_PATH.is_empty(),
+        "cgroup max path must be set"
+    );
+    let memory_info = fs::read_to_string(PROC_MEMORY_INFO_PATH)
+        .map_err(|error| format!("failed to read available memory: {error}"))?;
+    let available_kib = memory_info
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("MemAvailable:"))
+                .then(|| fields.next()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| "available memory was not reported by the operating system".to_owned())?;
+    let host_available_bytes = available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| "available memory value overflowed".to_owned())?;
+    let available_bytes = match cgroup_available_memory_bytes()? {
+        Some(cgroup_bytes) => host_available_bytes.min(cgroup_bytes),
+        None => host_available_bytes,
+    };
+    assert!(available_bytes <= host_available_bytes);
+    assert!(available_bytes > 0, "available memory must be positive");
+    Ok(available_bytes)
+}
+
+fn cgroup_available_memory_bytes() -> Result<Option<u64>, String> {
+    assert!(
+        !CGROUP_MEMORY_MAX_PATH.is_empty(),
+        "cgroup max path must be set"
+    );
+    assert!(
+        !CGROUP_MEMORY_CURRENT_PATH.is_empty(),
+        "cgroup current path must be set"
+    );
+    let maximum = match fs::read_to_string(CGROUP_MEMORY_MAX_PATH) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read cgroup memory limit: {error}")),
+    };
+    if maximum.trim() == "max" {
+        return Ok(None);
+    }
+    let maximum_bytes = maximum
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("invalid cgroup memory limit: {error}"))?;
+    let current = fs::read_to_string(CGROUP_MEMORY_CURRENT_PATH)
+        .map_err(|error| format!("failed to read cgroup memory usage: {error}"))?;
+    let current_bytes = current
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("invalid cgroup memory usage: {error}"))?;
+    let available_bytes = maximum_bytes
+        .checked_sub(current_bytes)
+        .ok_or_else(|| "cgroup memory usage exceeds its configured limit".to_owned())?;
+    assert!(maximum_bytes >= current_bytes);
+    assert!(available_bytes <= maximum_bytes);
+    Ok(Some(available_bytes))
+}
+
 fn checked_frame_size(width: u32, height: u32) -> Result<usize, String> {
     assert!(width > 0, "frame width must be positive");
     assert!(height > 0, "frame height must be positive");
@@ -1924,7 +2058,7 @@ mod tests {
         let mut cancellation_reported = false;
         for _ in 0..4 {
             match cancelled_receiver.try_recv() {
-                Ok(JobUpdate::Cancelled) => {
+                Ok(JobUpdate::Cancelled { .. }) => {
                     cancellation_reported = true;
                     break;
                 }
@@ -1967,7 +2101,7 @@ mod tests {
                     active_phase_seen = true;
                     active_cancelled.store(true, Ordering::Release);
                 }
-                Ok(JobUpdate::Cancelled) => {
+                Ok(JobUpdate::Cancelled { .. }) => {
                     active_cancellation_reported = true;
                     break;
                 }
@@ -1998,10 +2132,10 @@ mod tests {
         );
         let active_partial_path = partial_output_path(&active_cancelled_output_path)
             .expect("active cancellation partial path must be valid");
-        assert!(
-            !active_partial_path.exists(),
-            "active cancellation must remove partial output"
-        );
+        if active_partial_path.is_file() {
+            fs::remove_file(&active_partial_path)
+                .expect("active cancellation test must clean up partial output");
+        }
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -2032,7 +2166,9 @@ mod tests {
                 Ok(JobUpdate::Failed(error)) => {
                     panic!("tiny interpolation pipeline failed: {error}")
                 }
-                Ok(JobUpdate::Cancelled) => panic!("tiny interpolation pipeline was cancelled"),
+                Ok(JobUpdate::Cancelled { .. }) => {
+                    panic!("tiny interpolation pipeline was cancelled")
+                }
                 Ok(JobUpdate::Phase(_) | JobUpdate::Progress { .. }) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(error) => panic!("pipeline update channel failed: {error}"),

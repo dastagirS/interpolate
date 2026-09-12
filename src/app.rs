@@ -82,6 +82,51 @@ enum MainPageTab {
     Media,
 }
 
+struct SettingTooltip {
+    description: &'static str,
+}
+
+impl Render for SettingTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        assert!(
+            !self.description.is_empty(),
+            "tooltip description must not be empty"
+        );
+        assert!(
+            self.description.len() <= 512,
+            "tooltip description must remain bounded"
+        );
+        div()
+            .w(px(280.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER_STRONG_COLOR))
+            .bg(rgb(PANEL_COLOR))
+            .text_xs()
+            .text_color(rgb(TEXT_COLOR))
+            .child(self.description)
+    }
+}
+
+fn setting_tooltip_icon(description: &'static str) -> impl IntoElement {
+    assert!(
+        !description.is_empty(),
+        "tooltip description must not be empty"
+    );
+    assert!(
+        description.len() <= 512,
+        "tooltip description must remain bounded"
+    );
+    div()
+        .id(description)
+        .ml_1()
+        .text_color(rgb(TEXT_SUBTLE_COLOR))
+        .child("ⓘ")
+        .tooltip(move |_, cx| cx.new(|_| SettingTooltip { description }).into())
+}
+
 fn use_uhd_mode_default(content_preset: ContentPreset, metadata: Option<&VideoMetadata>) -> bool {
     assert!(UHD_WIDTH_MIN > 0, "UHD width threshold must be positive");
     assert!(UHD_HEIGHT_MIN > 0, "UHD height threshold must be positive");
@@ -1104,28 +1149,17 @@ impl InterpolateApp {
     fn set_main_page_tab(&mut self, tab: MainPageTab, cx: &mut Context<Self>) {
         assert!(self.target_fps_num > 0, "target FPS must remain valid");
         assert!(self.gpu_names.len() <= 16, "GPU list must remain bounded");
-        if !self.running {
-            self.main_page_tab = tab;
-            self.inference_backend_menu_open = false;
-            self.preset_menu_open = false;
-            self.video_encoder_menu_open = false;
-            self.gpu_menu_open = false;
-            self.encoder_preset_menu_open = false;
-            self.h264_profile_menu_open = false;
-            cx.notify();
-        }
-        assert!(
-            !self.running || self.main_page_tab == tab,
-            "running jobs cannot change tabs"
-        );
-        assert!(
-            !self.inference_backend_menu_open,
-            "tab changes must close inference backend menus"
-        );
-        assert!(
-            !self.preset_menu_open,
-            "tab changes must close preset menus"
-        );
+        self.main_page_tab = tab;
+        self.inference_backend_menu_open = false;
+        self.preset_menu_open = false;
+        self.video_encoder_menu_open = false;
+        self.gpu_menu_open = false;
+        self.encoder_preset_menu_open = false;
+        self.h264_profile_menu_open = false;
+        cx.notify();
+        assert_eq!(self.main_page_tab, tab, "tab selection must be retained");
+        assert!(!self.inference_backend_menu_open);
+        assert!(!self.preset_menu_open);
     }
 
     fn select_main_page_tab(&mut self, tab: MainPageTab, cx: &mut Context<Self>) {
@@ -1649,7 +1683,7 @@ impl InterpolateApp {
                             terminal = matches!(
                                 update,
                                 JobUpdate::Completed { .. }
-                                    | JobUpdate::Cancelled
+                                    | JobUpdate::Cancelled { .. }
                                     | JobUpdate::Failed(_)
                             );
                             let _ = this.update(cx, |app, cx| {
@@ -1742,10 +1776,15 @@ impl InterpolateApp {
                 self.cadence_diagnostics = cadence_diagnostics;
                 self.status = format!("Completed · {}", path.display());
             }
-            JobUpdate::Cancelled => {
+            JobUpdate::Cancelled { partial_path } => {
                 self.running = false;
                 self.cancellation = None;
-                self.status = "Cancelled safely".to_owned();
+                self.status = match partial_path {
+                    Some(path) => {
+                        format!("Cancelled · partial output saved: {}", path.display())
+                    }
+                    None => "Cancelled safely".to_owned(),
+                };
             }
             JobUpdate::Failed(error) => {
                 self.running = false;
@@ -1855,15 +1894,25 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("Quality").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child(format!(
-                                    "{quality_mode_label}; lower values mean higher quality"
-                                )),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("Quality")
+                                    .child(setting_tooltip_icon(
+                                        "CRF (CPU) and CQ (NVENC) target visual quality rather than a fixed bitrate. Lower values preserve more detail and produce larger files.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child(format!(
+                                        "{quality_mode_label}; lower values mean higher quality"
+                                    )),
+                            ),
                     )
                     .child(
                         div()
@@ -1908,13 +1957,23 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("Speed preset").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child("Controls the quality/speed trade-off"),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("Speed preset")
+                                    .child(setting_tooltip_icon(
+                                        "Controls encoder complexity. Faster presets finish sooner and usually create larger files; slower presets spend more CPU/GPU time to improve compression efficiency.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("Controls the quality/speed trade-off"),
+                            ),
                     )
                     .child(
                         div()
@@ -1956,13 +2015,23 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("H.264 profile").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child("Auto is recommended for compatibility"),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("H.264 profile")
+                                    .child(setting_tooltip_icon(
+                                        "Sets which H.264 features the output may use. Auto chooses a broadly compatible profile; High can improve compression but may not play everywhere.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("Auto is recommended for compatibility"),
+                            ),
                     )
                     .child(
                         div()
@@ -2002,13 +2071,23 @@ impl InterpolateApp {
                     .items_center()
                     .justify_between()
                     .child(
-                        div().child("Encoder threads").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child("0 means FFmpeg automatic mode"),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("Encoder threads")
+                                    .child(setting_tooltip_icon(
+                                        "Limits the number of CPU threads used by FFmpeg while encoding. Zero delegates the choice to FFmpeg; fewer threads reduce contention but may slow encoding.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("0 means FFmpeg automatic mode"),
+                            ),
                     )
                     .child(
                         div()
@@ -2190,13 +2269,23 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("RIFE inference backend").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child(cuda_description),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("RIFE inference backend")
+                                    .child(setting_tooltip_icon(
+                                        "Vulkan / ncnn is the self-contained fallback. CUDA / PyTorch uses the bundled Python runtime and RIFE model, and requires a compatible NVIDIA driver.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child(cuda_description),
+                            ),
                     )
                     .child(
                         div()
@@ -2242,13 +2331,23 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("Video encoder").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child("Hardware acceleration is tested at startup"),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("Video encoder")
+                                    .child(setting_tooltip_icon(
+                                        "Controls how the final H.264 video is compressed. NVENC uses the NVIDIA GPU; CPU H.264 is slower but works without NVIDIA encoding support.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("Hardware acceleration is tested at startup"),
+                            ),
                     )
                     .child(
                         div()
@@ -2290,17 +2389,27 @@ impl InterpolateApp {
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
-                        div().child("NVIDIA hardware decode").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child(if nvdec_available {
-                                    "Optional NVDEC acceleration for video decoding"
-                                } else {
-                                    "Unavailable: NVIDIA FFmpeg decode support not detected"
-                                }),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("NVIDIA hardware decode")
+                                    .child(setting_tooltip_icon(
+                                        "Uses NVDEC to decode the input on the NVIDIA GPU. It can reduce CPU use, but it is independent of RIFE inference and uses additional GPU resources.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child(if nvdec_available {
+                                        "Optional NVDEC acceleration for video decoding"
+                                    } else {
+                                        "Unavailable: NVIDIA FFmpeg decode support not detected"
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -2337,13 +2446,23 @@ impl InterpolateApp {
                     .items_center()
                     .justify_between()
                     .child(
-                        div().child("Compute device").child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                .child("Vulkan inference device"),
-                        ),
+                        div()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child("Compute device")
+                                    .child(setting_tooltip_icon(
+                                        "Selects the Vulkan GPU used by the ncnn RIFE backend. This setting does not select the NVENC/NVDEC device or the CUDA backend.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                    .child("Vulkan inference device"),
+                            ),
                     )
                     .child(
                         div()
@@ -2407,7 +2526,8 @@ impl InterpolateApp {
                                     PANEL_COLOR
                                 }))
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.select_inference_backend(false, cx)
+                                    app.select_inference_backend(false, cx);
+                                    cx.stop_propagation();
                                 }))
                                 .child("Vulkan / ncnn")
                                 .child(if !self.cuda_inference_enabled {
@@ -2426,7 +2546,10 @@ impl InterpolateApp {
                                 .justify_between()
                                 .when(self.cuda_inference_available, |element| {
                                     element.cursor_pointer().on_click(cx.listener(
-                                        |app, _, _, cx| app.select_inference_backend(true, cx),
+                                        |app, _, _, cx| {
+                                            app.select_inference_backend(true, cx);
+                                            cx.stop_propagation();
+                                        },
                                     ))
                                 })
                                 .bg(rgb(if self.cuda_inference_enabled {
@@ -2563,16 +2686,27 @@ impl InterpolateApp {
             )
             .children(
                 [
-                    ("Audio", "preserve-audio-main", self.preserve_audio),
+                    (
+                        "Audio",
+                        "preserve-audio-main",
+                        self.preserve_audio,
+                        "Copies the primary audio stream into the MKV without re-encoding. Disable it to create a silent video output.",
+                    ),
                     (
                         "Subtitles",
                         "preserve-subtitles-main",
                         self.preserve_subtitles,
+                        "Copies subtitle streams into the MKV without re-encoding. It does not burn subtitles into the video image.",
                     ),
-                    ("Metadata", "preserve-metadata-main", self.preserve_metadata),
+                    (
+                        "Metadata",
+                        "preserve-metadata-main",
+                        self.preserve_metadata,
+                        "Copies compatible stream and container metadata such as language and title tags. It does not copy the video or audio data itself.",
+                    ),
                 ]
                 .into_iter()
-                .map(|(label, id, enabled)| {
+                .map(|(label, id, enabled, description)| {
                     let toggle = div()
                         .id(id)
                         .px_3()
@@ -2599,7 +2733,13 @@ impl InterpolateApp {
                         .justify_between()
                         .border_b_1()
                         .border_color(rgb(BORDER_COLOR))
-                        .child(label)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(label)
+                                .child(setting_tooltip_icon(description)),
+                        )
                         .child(toggle)
                 }),
             )
@@ -2673,11 +2813,6 @@ impl Render for InterpolateApp {
         let output_frame_estimate = self.metadata.as_ref().map_or(0_u64, |metadata| {
             (metadata.duration_seconds * f64::from(self.target_fps_num)).ceil() as u64
         });
-        let gpu_label = self
-            .gpu_names
-            .get(self.selected_gpu_index)
-            .cloned()
-            .unwrap_or_else(|| "No Vulkan device".to_owned());
         let frame_label = if self.frame_count_estimate > 0 {
             format!(
                 "{} / {} frames",
@@ -3015,17 +3150,27 @@ impl Render for InterpolateApp {
                                     .items_center()
                                     .justify_between()
                                     .child(
-                                        div().child("Keep running in background").child(
-                                            div()
-                                                .mt_1()
-                                                .text_xs()
-                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                .child(if self.tray_controller.is_some() {
-                                                    "Closing the window minimizes the job to the system tray"
-                                                } else {
-                                                    "System tray unavailable on this desktop"
-                                                }),
-                                        ),
+                                        div()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .child("Keep running in background")
+                                                    .child(setting_tooltip_icon(
+                                                        "When enabled, closing the window hides the interface while the active job continues. Use the system-tray menu to restore the window or cancel the job.",
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .mt_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                                    .child(if self.tray_controller.is_some() {
+                                                        "Closing the window minimizes the job to the system tray"
+                                                    } else {
+                                                        "System tray unavailable on this desktop"
+                                                    }),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -3169,13 +3314,23 @@ impl Render for InterpolateApp {
                                                     .items_center()
                                                     .justify_between()
                                                     .child(
-                                                        div().child("Content preset").child(
-                                                            div()
-                                                                .mt_1()
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child("Profile tuning follows clip tests"),
-                                                        ),
+                                                        div()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("Content preset")
+                                                                    .child(setting_tooltip_icon(
+                                                                        "Movie is tuned for live-action footage. Anime enables cadence protection and automatically favors half-scale flow for 4K sources.",
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                    .child("Profile tuning follows clip tests"),
+                                                            ),
                                                     )
                                                     .child(
                                                         div()
@@ -3225,13 +3380,23 @@ impl Render for InterpolateApp {
                                                     .border_t_1()
                                                     .border_color(rgb(BORDER_COLOR))
                                                     .child(
-                                                        div().child("Target frame rate").child(
-                                                            div()
-                                                                .mt_1()
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child("Enter 1–480 frames per second"),
-                                                        ),
+                                                        div()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("Target frame rate")
+                                                                    .child(setting_tooltip_icon(
+                                                                        "The output frame rate. RIFE creates intermediate frames only as needed to reach this rate; it does not change the source resolution.",
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                    .child("Enter 1–480 frames per second"),
+                                                            ),
                                                     )
                                                     .child(
                                                         div()
@@ -3279,17 +3444,27 @@ impl Render for InterpolateApp {
                                                     .border_t_1()
                                                     .border_color(rgb(BORDER_COLOR))
                                                     .child(
-                                                        div().child("Scene change protection").child(
-                                                            div()
-                                                                .mt_1()
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child(if anime_preset_selected {
-                                                                    "Required for cadence safety"
-                                                                } else {
-                                                                    "Duplicate at hard cuts"
-                                                                }),
-                                                        ),
+                                                        div()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("Scene change protection")
+                                                                    .child(setting_tooltip_icon(
+                                                                        "Detects hard cuts and avoids inventing motion across them. The frame before a cut is duplicated instead, preventing flashes and blended scenes.",
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                    .child(if anime_preset_selected {
+                                                                        "Required for cadence safety"
+                                                                    } else {
+                                                                        "Duplicate at hard cuts"
+                                                                    }),
+                                                            ),
                                                     )
                                                     .child(
                                                         div()
@@ -3327,17 +3502,27 @@ impl Render for InterpolateApp {
                                                     .border_t_1()
                                                     .border_color(rgb(BORDER_COLOR))
                                                     .child(
-                                                        div().child("Half-scale UHD flow").child(
-                                                            div()
-                                                                .mt_1()
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED_COLOR))
-                                                                .child(if anime_preset_selected {
-                                                                    "Automatic for 4K; click to override"
-                                                                } else {
-                                                                    "Reduce memory for 4K sources"
-                                                                }),
-                                                        ),
+                                                        div()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("Half-scale UHD flow")
+                                                                    .child(setting_tooltip_icon(
+                                                                        "Runs the RIFE model at half resolution and scales the result back up. This greatly reduces GPU memory use for UHD video, with some loss of fine detail.",
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(TEXT_MUTED_COLOR))
+                                                                    .child(if anime_preset_selected {
+                                                                        "Automatic for 4K; click to override"
+                                                                    } else {
+                                                                        "Reduce memory for 4K sources"
+                                                                    }),
+                                                            ),
                                                     )
                                                     .child(
                                                         div()

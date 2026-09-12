@@ -15,7 +15,6 @@ import vapoursynth as vapoursynth
 import vsrife
 
 RGB_CHANNEL_COUNT = 3
-MODEL_NAME = "4.25"
 RIFE_MODULO = 64
 TIMESTEP_HEADER = struct.Struct("<f")
 CUDA_WORKER_READY = b"RIF1"
@@ -46,11 +45,13 @@ def load_network(model_path: Path, device: torch.device):
     assert model_path.is_file()
     assert device.type == "cuda"
     model_directory = str(model_path.parent)
+    model_name = model_path.name
+    assert model_name
     vsrife.model_dir = model_directory
     from vsrife.IFNet_HDv3_v4_25 import Head, IFNet
 
     network, encoder = vsrife.init_module(
-        MODEL_NAME,
+        model_name,
         IFNet,
         1.0,
         False,
@@ -77,11 +78,43 @@ def make_grid(width: int, height: int, device: torch.device):
 
 def frame_tensor(frame: bytes, width: int, height: int, device: torch.device):
     assert len(frame) == width * height * RGB_CHANNEL_COUNT
+    assert width > 0 and height > 0
     pixels = numpy.frombuffer(frame, dtype=numpy.uint8)
     pixels = pixels.reshape(height, width, RGB_CHANNEL_COUNT)
     pixels = pixels.transpose(2, 0, 1)
     tensor = torch.from_numpy(pixels.copy()).to(device=device, dtype=torch.float16)
     return tensor.unsqueeze(0).div_(255.0)
+
+
+def half_scale_frame(frame: bytes, width: int, height: int) -> tuple[bytes, int, int]:
+    assert len(frame) == width * height * RGB_CHANNEL_COUNT
+    assert width > 0 and height > 0
+    scaled_width = (width + 1) // 2
+    scaled_height = (height + 1) // 2
+    pixels = numpy.frombuffer(frame, dtype=numpy.uint8).reshape(
+        height, width, RGB_CHANNEL_COUNT
+    )
+    scaled_pixels = pixels[::2, ::2, :].copy()
+    assert scaled_pixels.shape == (scaled_height, scaled_width, RGB_CHANNEL_COUNT)
+    return scaled_pixels.tobytes(), scaled_width, scaled_height
+
+
+def double_scale_frame(
+    frame: bytes, scaled_width: int, scaled_height: int, width: int, height: int
+) -> bytes:
+    assert len(frame) == scaled_width * scaled_height * RGB_CHANNEL_COUNT
+    assert width > 0 and height > 0
+    assert scaled_width == (width + 1) // 2
+    assert scaled_height == (height + 1) // 2
+    pixels = numpy.frombuffer(frame, dtype=numpy.uint8).reshape(
+        scaled_height, scaled_width, RGB_CHANNEL_COUNT
+    )
+    horizontal_indices = numpy.minimum(numpy.arange(width) // 2, scaled_width - 1)
+    vertical_indices = numpy.minimum(numpy.arange(height) // 2, scaled_height - 1)
+    expanded_pixels = pixels[vertical_indices[:, None], horizontal_indices[None, :], :]
+    result = expanded_pixels.tobytes()
+    assert len(result) == width * height * RGB_CHANNEL_COUNT
+    return result
 
 
 def interpolate(
@@ -116,26 +149,27 @@ def interpolate(
         dtype=torch.float16,
         device=device,
     )
-    if encoder is None:
-        output = network(
-            image_before,
-            image_after,
-            timestep_tensor,
-            flow_divisor,
-            grid,
-        )
-    else:
-        encoded_before = encoder(image_before)
-        encoded_after = encoder(image_after)
-        output = network(
-            image_before,
-            image_after,
-            timestep_tensor,
-            flow_divisor,
-            grid,
-            encoded_before,
-            encoded_after,
-        )
+    with torch.inference_mode():
+        if encoder is None:
+            output = network(
+                image_before,
+                image_after,
+                timestep_tensor,
+                flow_divisor,
+                grid,
+            )
+        else:
+            encoded_before = encoder(image_before)
+            encoded_after = encoder(image_after)
+            output = network(
+                image_before,
+                image_after,
+                timestep_tensor,
+                flow_divisor,
+                grid,
+                encoded_before,
+                encoded_after,
+            )
     torch.cuda.synchronize(device)
     output = output[:, :, :height, :width].squeeze(0).float().clamp_(0.0, 1.0)
     pixels = output.permute(1, 2, 0).mul(255.0).round().to(torch.uint8).cpu().numpy()
@@ -150,6 +184,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--half-scale", action="store_true")
     arguments = parser.parse_args()
     assert 0 < arguments.width <= 16384
     assert 0 < arguments.height <= 16384
@@ -164,7 +199,7 @@ def main() -> None:
         fail("CUDA RIFE frame exceeds the safety limit")
     if not torch.cuda.is_available():
         fail("PyTorch reports that CUDA is unavailable")
-    if vapoursynth.__api_version__ < 4:
+    if vapoursynth.__api_version__.api_major < 4:
         fail("VapourSynth API version 4 or newer is required")
     device = torch.device("cuda", arguments.gpu)
     network, encoder = load_network(arguments.model, device)
@@ -179,16 +214,35 @@ def main() -> None:
         (timestep,) = TIMESTEP_HEADER.unpack(timestep_bytes)
         frame_before = read_exact(sys.stdin.buffer, frame_size)
         frame_after = read_exact(sys.stdin.buffer, frame_size)
+        processing_width = arguments.width
+        processing_height = arguments.height
+        if arguments.half_scale:
+            frame_before, processing_width, processing_height = half_scale_frame(
+                frame_before, arguments.width, arguments.height
+            )
+            frame_after, after_width, after_height = half_scale_frame(
+                frame_after, arguments.width, arguments.height
+            )
+            assert after_width == processing_width
+            assert after_height == processing_height
         output = interpolate(
             network,
             encoder,
             frame_before,
             frame_after,
-            arguments.width,
-            arguments.height,
+            processing_width,
+            processing_height,
             timestep,
             device,
         )
+        if arguments.half_scale:
+            output = double_scale_frame(
+                output,
+                processing_width,
+                processing_height,
+                arguments.width,
+                arguments.height,
+            )
         sys.stdout.buffer.write(output)
         sys.stdout.buffer.flush()
 
