@@ -15,6 +15,7 @@ sudo rm -f \
     /etc/apt/sources.list.d/google-chrome.sources
 sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
+    binutils \
     build-essential \
     cmake \
     ffmpeg \

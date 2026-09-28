@@ -2,6 +2,7 @@
 /target/
 /dist/
 /runtime/
+/artifacts/
 *.o
 *.a
 *.so

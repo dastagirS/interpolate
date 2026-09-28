@@ -2,7 +2,10 @@ mod scheduler;
 
 pub use crate::cadence::{CadenceDiagnostics, ContentPreset};
 use crate::{
-    backend::{Backend, CudaBackend, InferenceBackend, InferenceEngine},
+    backend::{
+        Backend, CudaBackend, InferenceBackend, InferenceEngine, cuda_device_index_for_gpu,
+        cuda_free_memory_bytes, cuda_inference_device_index_for_gpu,
+    },
     cadence::{
         FrameDifference, is_confident_duplicate, is_smoothable_cadence_run,
         measure_frame_difference_rgb24,
@@ -13,7 +16,7 @@ use scheduler::OutputScheduler;
 use serde::Deserialize;
 use std::{
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
@@ -31,6 +34,10 @@ const FRAME_BUFFER_COUNT: u64 = 3;
 const FRAME_DIMENSION_MAX: u32 = 16_384;
 const MEMORY_CONSTRAINED_AVAILABLE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const MEMORY_SAFETY_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CUDA_HALF_SCALE_FREE_MEMORY_MIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CUDA_FULL_SCALE_FREE_MEMORY_MIN_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const UHD_WIDTH_MIN: u32 = 3840;
+const UHD_HEIGHT_MIN: u32 = 2160;
 const CGROUP_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
 const CGROUP_MEMORY_CURRENT_PATH: &str = "/sys/fs/cgroup/memory.current";
 const PROC_MEMORY_INFO_PATH: &str = "/proc/meminfo";
@@ -39,11 +46,16 @@ const TARGET_FPS_MAX: u32 = 480;
 const ENCODER_QUALITY_MAX: u8 = 51;
 const ENCODER_THREAD_COUNT_MAX: u8 = 16;
 const FFMPEG_THREAD_COUNT: &str = "2";
+const MEDIA_GRACEFUL_WAIT_POLL_COUNT_MAX: usize = 250;
+const MEDIA_GRACEFUL_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ENCODER_PROBE_WIDTH: &str = "256";
 const ENCODER_PROBE_HEIGHT: &str = "256";
 const ENCODER_PROBE_FRAME_COUNT: &str = "1";
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENCODER_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const HWACCEL_PROBE_OUTPUT_SIZE_MAX: usize = 64 * 1024;
+const FRAME_RATE_TIMESTAMP_LINE_SIZE_MAX: usize = 64;
+const FRAME_INTERVAL_TOLERANCE_SECONDS: f64 = 0.0005;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_DIAGNOSTIC_SIZE_BYTES_MAX: usize = 64 * 1024;
 const PROBE_DIAGNOSTIC_LINE_COUNT_MAX: usize = 200;
@@ -207,6 +219,40 @@ pub fn probe_video(input_path: &Path) -> Result<VideoMetadata, String> {
     probe_video_logged(input_path, None)
 }
 
+pub fn available_nvdec() -> bool {
+    assert!(
+        HWACCEL_PROBE_OUTPUT_SIZE_MAX > 0,
+        "hardware acceleration probe output limit must be positive"
+    );
+    let output = match Command::new("ffmpeg")
+        .args(["-hide_banner", "-hwaccels"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success()
+        || output.stdout.len() > HWACCEL_PROBE_OUTPUT_SIZE_MAX
+        || output.stderr.len() > HWACCEL_PROBE_OUTPUT_SIZE_MAX
+    {
+        return false;
+    }
+    let hardware_accelerators = String::from_utf8_lossy(&output.stdout);
+    let available = hardware_accelerators
+        .lines()
+        .any(|line| line.trim() == "cuda");
+    assert!(
+        output.stdout.len() <= HWACCEL_PROBE_OUTPUT_SIZE_MAX,
+        "hardware acceleration probe output must remain bounded"
+    );
+    assert!(
+        output.stderr.len() <= HWACCEL_PROBE_OUTPUT_SIZE_MAX,
+        "hardware acceleration diagnostics must remain bounded"
+    );
+    available
+}
+
 pub fn available_video_encoders() -> Vec<VideoEncoder> {
     assert!(
         !ENCODER_PROBE_WIDTH.is_empty(),
@@ -365,12 +411,14 @@ fn probe_video_logged(input_path: &Path, log: Option<&JobLog>) -> Result<VideoMe
     }
     checked_frame_size(width, height)?;
 
-    let (source_fps_num, source_fps_den) = parse_rational(
+    let average_frame_rate = parse_rational(
         stream
             .avg_frame_rate
             .as_deref()
             .ok_or_else(|| "video frame rate is unavailable".to_owned())?,
     )?;
+    validate_constant_frame_rate(input_path)?;
+    let (source_fps_num, source_fps_den) = average_frame_rate;
     let duration_text = stream
         .duration
         .as_deref()
@@ -593,7 +641,7 @@ pub fn run_job(
         Err(_) if cancelled.load(Ordering::Acquire) => JobUpdate::Cancelled {
             partial_path: partial_output_path(&configuration.output_path)
                 .ok()
-                .filter(|path| path.is_file()),
+                .filter(|path| partial_output_is_playable(path)),
         },
         Err(error) => JobUpdate::Failed(error),
     };
@@ -740,7 +788,66 @@ fn run_job_inner(
             JobUpdate::Phase("Using low-memory processing mode"),
         );
     }
-    let configuration = effective_configuration;
+    let mut configuration = effective_configuration;
+    if configuration.use_nvdec && nvdec_download_format(&metadata.pixel_format).is_none() {
+        send_update(
+            updates,
+            JobUpdate::Phase("Input format is unsupported by NVDEC; using CPU decode"),
+        );
+        configuration.use_nvdec = false;
+    }
+    let may_use_cuda = configuration.use_nvdec
+        || matches!(
+            configuration.inference_backend,
+            InferenceBackend::CudaPytorchVapourSynth
+        )
+        || matches!(
+            configuration.video_encoder,
+            VideoEncoder::Automatic | VideoEncoder::NvidiaH264
+        );
+    let cuda_gpu_index = if may_use_cuda {
+        let map_gpu_index = if matches!(
+            configuration.inference_backend,
+            InferenceBackend::CudaPytorchVapourSynth
+        ) {
+            cuda_inference_device_index_for_gpu
+        } else {
+            cuda_device_index_for_gpu
+        };
+        match map_gpu_index(configuration.gpu_index) {
+            Ok(index) => Some(index),
+            Err(error)
+                if configuration.use_nvdec
+                    || matches!(
+                        configuration.inference_backend,
+                        InferenceBackend::CudaPytorchVapourSynth
+                    )
+                    || configuration.video_encoder == VideoEncoder::NvidiaH264 =>
+            {
+                return Err(error);
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if matches!(
+        configuration.inference_backend,
+        InferenceBackend::CudaPytorchVapourSynth
+    ) {
+        let cuda_gpu_index =
+            cuda_gpu_index.ok_or_else(|| "CUDA device mapping is unavailable".to_owned())?;
+        let (adjusted_configuration, vram_constrained) =
+            adapt_configuration_for_cuda_memory(&configuration, &metadata, cuda_gpu_index)?;
+        configuration = adjusted_configuration;
+        if vram_constrained {
+            send_update(
+                updates,
+                JobUpdate::Phase("Using half-scale CUDA mode for available VRAM"),
+            );
+        }
+    }
+    let encoder_gpu_index = cuda_gpu_index;
 
     send_update(updates, JobUpdate::Phase("Initializing inference backend"));
     let mut backend = match configuration.inference_backend {
@@ -752,12 +859,16 @@ fn run_job_inner(
                 configuration.use_uhd_mode,
             )?)
         }
-        InferenceBackend::CudaPytorchVapourSynth => InferenceEngine::Cuda(CudaBackend::create(
-            metadata.width,
-            metadata.height,
-            configuration.gpu_index,
-            configuration.use_uhd_mode,
-        )?),
+        InferenceBackend::CudaPytorchVapourSynth => {
+            let cuda_gpu_index =
+                cuda_gpu_index.ok_or_else(|| "CUDA device mapping is unavailable".to_owned())?;
+            InferenceEngine::Cuda(CudaBackend::create(
+                metadata.width,
+                metadata.height,
+                cuda_gpu_index,
+                configuration.use_uhd_mode,
+            )?)
+        }
     };
 
     let partial_path = partial_output_path(&configuration.output_path)?;
@@ -767,9 +878,15 @@ fn run_job_inner(
     }
 
     send_update(updates, JobUpdate::Phase("Starting media pipeline"));
-    let mut decoder = spawn_decoder(&configuration, &metadata, log)?;
+    let mut decoder = spawn_decoder(&configuration, &metadata, cuda_gpu_index, log)?;
     let mut encoder_configuration = configuration.clone();
-    let encoder_result = match spawn_encoder(&configuration, &metadata, &partial_path, log) {
+    let encoder_result = match spawn_encoder(
+        &configuration,
+        &metadata,
+        &partial_path,
+        encoder_gpu_index,
+        log,
+    ) {
         Ok(encoder) => Ok(encoder),
         Err(error)
             if matches!(
@@ -782,11 +899,16 @@ fn run_job_inner(
                 JobUpdate::Phase("NVENC unavailable; falling back to CPU H.264"),
             );
             encoder_configuration.video_encoder = VideoEncoder::SoftwareH264;
-            spawn_encoder(&encoder_configuration, &metadata, &partial_path, log).map_err(
-                |fallback_error| {
-                    format!("NVENC failed: {error}; CPU H.264 fallback failed: {fallback_error}")
-                },
+            spawn_encoder(
+                &encoder_configuration,
+                &metadata,
+                &partial_path,
+                encoder_gpu_index,
+                log,
             )
+            .map_err(|fallback_error| {
+                format!("NVENC failed: {error}; CPU H.264 fallback failed: {fallback_error}")
+            })
         }
         Err(error) => Err(error),
     };
@@ -819,32 +941,43 @@ fn run_job_inner(
     ) {
         Ok(cadence_diagnostics) => cadence_diagnostics,
         Err(error) => {
-            let decoder_terminate_result = terminate_child(&mut decoder.child);
-            let encoder_terminate_result = terminate_child(&mut encoder.child);
-            let decoder_log_result = finish_log_worker(&mut decoder);
-            let encoder_log_result = finish_log_worker(&mut encoder);
             let was_cancelled = cancelled.load(Ordering::Acquire);
+            let decoder_terminate_result = terminate_child(&mut decoder.child);
+            let decoder_log_result = finish_log_worker(&mut decoder);
+            let mut encoder_graceful = false;
+            let encoder_cleanup_result = if was_cancelled {
+                match wait_media_child_with_timeout(&mut encoder, "encoder") {
+                    Ok((status, graceful)) => {
+                        encoder_graceful = graceful && status.success();
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                let terminate_result = terminate_child(&mut encoder.child);
+                let log_result = finish_log_worker(&mut encoder);
+                terminate_result.and(log_result)
+            };
             let mut combined_error = error;
             if partial_path.exists() {
                 combined_error.push_str(&format!(
-                    "; recoverable partial output remains at {}",
+                    "; partial output remains at {}",
                     partial_path.display()
                 ));
             }
-            if was_cancelled {
-                combined_error.push_str("; encoded frames were preserved");
+            if was_cancelled && encoder_graceful {
+                combined_error.push_str("; partial output was finalized gracefully");
+            } else if was_cancelled {
+                combined_error.push_str("; partial output may be incomplete");
             }
             if let Err(terminate_error) = decoder_terminate_result {
                 combined_error.push_str(&format!("; decoder cleanup failed: {terminate_error}"));
             }
-            if let Err(terminate_error) = encoder_terminate_result {
-                combined_error.push_str(&format!("; encoder cleanup failed: {terminate_error}"));
+            if let Err(encoder_error) = encoder_cleanup_result {
+                combined_error.push_str(&format!("; encoder cleanup failed: {encoder_error}"));
             }
             if let Err(log_error) = decoder_log_result {
                 combined_error.push_str(&format!("; decoder diagnostics failed: {log_error}"));
-            }
-            if let Err(log_error) = encoder_log_result {
-                combined_error.push_str(&format!("; encoder diagnostics failed: {log_error}"));
             }
             return Err(combined_error);
         }
@@ -853,7 +986,15 @@ fn run_job_inner(
     send_update(updates, JobUpdate::Phase("Finalizing output"));
     let decoder_result = wait_media_child(&mut decoder, "decoder");
     let encoder_result = wait_media_child(&mut encoder, "encoder");
-    let decoder_status = decoder_result?;
+    let decoder_status = match decoder_result {
+        Ok(status) => status,
+        Err(error) => {
+            if let Err(encoder_error) = encoder_result {
+                return Err(format!("{error}; encoder cleanup failed: {encoder_error}"));
+            }
+            return Err(error);
+        }
+    };
     let encoder_status = encoder_result?;
     if !decoder_status.success() {
         return Err(format!(
@@ -901,6 +1042,14 @@ fn validate_configuration(configuration: &JobConfiguration) -> Result<(), String
     }
     if configuration.output_path.exists() {
         return Err("output already exists; choose another filename".to_owned());
+    }
+    let is_mkv_output = configuration
+        .output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"));
+    if !is_mkv_output {
+        return Err("output filename must use the .mkv extension".to_owned());
     }
     if configuration.target_fps_num == 0
         || configuration.target_fps_den == 0
@@ -975,9 +1124,28 @@ struct MediaChild {
     log_worker: Option<JoinHandle<Result<(), String>>>,
 }
 
+fn nvdec_download_format(pixel_format: &str) -> Option<&'static str> {
+    assert!(
+        pixel_format.len() <= 32,
+        "input pixel format must remain bounded"
+    );
+    let download_format = match pixel_format {
+        "yuv420p" | "yuvj420p" | "nv12" => Some("nv12"),
+        "yuv420p10le" | "yuvj420p10le" | "p010le" => Some("p010le"),
+        "yuv444p" | "yuvj444p" => Some("yuv444p"),
+        _ => None,
+    };
+    assert!(
+        download_format.is_none_or(|format| !format.is_empty()),
+        "NVDEC download format must not be empty"
+    );
+    download_format
+}
+
 fn spawn_decoder(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
+    cuda_gpu_index: Option<i32>,
     log: &JobLog,
 ) -> Result<MediaChild, String> {
     assert!(metadata.width > 0, "decoder width must be positive");
@@ -985,7 +1153,16 @@ fn spawn_decoder(
     let mut command = Command::new("ffmpeg");
     command.args(["-nostdin", "-v", "error", "-threads", FFMPEG_THREAD_COUNT]);
     if configuration.use_nvdec {
-        command.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]);
+        let cuda_gpu_index =
+            cuda_gpu_index.ok_or_else(|| "NVDEC CUDA device mapping is unavailable".to_owned())?;
+        command.args([
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_device",
+            &cuda_gpu_index.to_string(),
+            "-hwaccel_output_format",
+            "cuda",
+        ]);
     }
     command.arg("-i").arg(&configuration.input_path).args([
         "-map",
@@ -997,7 +1174,14 @@ fn spawn_decoder(
         "passthrough",
     ]);
     if configuration.use_nvdec {
-        command.args(["-vf", "hwdownload,format=rgb24"]);
+        let download_format = nvdec_download_format(&metadata.pixel_format).ok_or_else(|| {
+            format!(
+                "NVDEC does not support input pixel format {}",
+                metadata.pixel_format
+            )
+        })?;
+        let filter = format!("hwdownload,format={download_format},format=rgb24");
+        command.args(["-vf", &filter]);
     } else {
         command.args(["-pix_fmt", "rgb24"]);
     }
@@ -1039,22 +1223,30 @@ fn spawn_decoder(
     })
 }
 
-fn resolve_video_encoder(configuration: &JobConfiguration) -> VideoEncoder {
-    assert!(
-        configuration.gpu_index >= 0,
-        "encoder GPU index must be non-negative"
-    );
+fn resolve_video_encoder(
+    configuration: &JobConfiguration,
+    encoder_gpu_index: Option<i32>,
+) -> VideoEncoder {
+    if let Some(encoder_gpu_index) = encoder_gpu_index {
+        assert!(
+            encoder_gpu_index >= 0,
+            "encoder GPU index must be non-negative"
+        );
+    }
     assert!(matches!(
         configuration.video_encoder,
         VideoEncoder::Automatic | VideoEncoder::SoftwareH264 | VideoEncoder::NvidiaH264
     ));
     let resolved_encoder = match configuration.video_encoder {
-        VideoEncoder::Automatic
-            if encoder_is_available_for_gpu("h264_nvenc", Some(configuration.gpu_index)) =>
-        {
-            VideoEncoder::NvidiaH264
-        }
-        VideoEncoder::Automatic | VideoEncoder::SoftwareH264 => VideoEncoder::SoftwareH264,
+        VideoEncoder::Automatic => match encoder_gpu_index {
+            Some(encoder_gpu_index)
+                if encoder_is_available_for_gpu("h264_nvenc", Some(encoder_gpu_index)) =>
+            {
+                VideoEncoder::NvidiaH264
+            }
+            Some(_) | None => VideoEncoder::SoftwareH264,
+        },
+        VideoEncoder::SoftwareH264 => VideoEncoder::SoftwareH264,
         VideoEncoder::NvidiaH264 => VideoEncoder::NvidiaH264,
     };
     assert!(!matches!(resolved_encoder, VideoEncoder::Automatic));
@@ -1109,6 +1301,7 @@ fn spawn_encoder(
     configuration: &JobConfiguration,
     metadata: &VideoMetadata,
     partial_path: &Path,
+    encoder_gpu_index: Option<i32>,
     log: &JobLog,
 ) -> Result<MediaChild, String> {
     assert!(metadata.width > 0, "encoder width must be positive");
@@ -1129,14 +1322,16 @@ fn spawn_encoder(
         configuration.encoder_thread_count <= ENCODER_THREAD_COUNT_MAX,
         "encoder threads must remain bounded"
     );
-    let effective_video_encoder = resolve_video_encoder(configuration);
-    if effective_video_encoder == VideoEncoder::NvidiaH264
-        && !encoder_is_available_for_gpu("h264_nvenc", Some(configuration.gpu_index))
-    {
-        return Err(format!(
-            "NVIDIA NVENC is unavailable on GPU {}",
-            configuration.gpu_index
-        ));
+    let effective_video_encoder = resolve_video_encoder(configuration, encoder_gpu_index);
+    if effective_video_encoder == VideoEncoder::NvidiaH264 {
+        let Some(encoder_gpu_index) = encoder_gpu_index else {
+            return Err("NVIDIA NVENC requires a mapped CUDA GPU".to_owned());
+        };
+        if !encoder_is_available_for_gpu("h264_nvenc", Some(encoder_gpu_index)) {
+            return Err(format!(
+                "NVIDIA NVENC is unavailable on CUDA GPU {encoder_gpu_index}"
+            ));
+        }
     }
     let encoder_preset =
         encoder_preset_argument(effective_video_encoder, configuration.encoder_preset);
@@ -1163,7 +1358,9 @@ fn spawn_encoder(
             "-b:v".to_owned(),
             "0".to_owned(),
             "-gpu".to_owned(),
-            configuration.gpu_index.to_string(),
+            encoder_gpu_index
+                .expect("NVIDIA encoder must have a mapped CUDA GPU")
+                .to_string(),
         ]),
         VideoEncoder::Automatic => unreachable!("automatic encoder must be resolved"),
     }
@@ -1505,6 +1702,111 @@ fn read_frame(reader: &mut ChildStdout, frame: &mut [u8]) -> Result<bool, String
     Ok(true)
 }
 
+fn validate_constant_frame_rate(path: &Path) -> Result<(), String> {
+    assert!(
+        !path.as_os_str().is_empty(),
+        "frame-rate probe path must not be empty"
+    );
+    assert!(
+        FRAME_RATE_TIMESTAMP_LINE_SIZE_MAX > 0,
+        "frame timestamp line limit must be positive"
+    );
+    let mut child = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to probe frame timestamps: {error}"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = terminate_child(&mut child);
+            return Err("frame timestamp output was unavailable".to_owned());
+        }
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::with_capacity(FRAME_RATE_TIMESTAMP_LINE_SIZE_MAX);
+    let mut frame_count = 0_usize;
+    let mut previous_timestamp: Option<f64> = None;
+    let mut first_interval: Option<f64> = None;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line).map_err(|error| {
+            let _ = terminate_child(&mut child);
+            format!("failed to read frame timestamps: {error}")
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        if line.len() > FRAME_RATE_TIMESTAMP_LINE_SIZE_MAX {
+            let _ = terminate_child(&mut child);
+            return Err("frame timestamp line exceeded the safety limit".to_owned());
+        }
+        let Ok(timestamp_text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Ok(timestamp) = timestamp_text.trim().parse::<f64>() else {
+            continue;
+        };
+        frame_count = frame_count
+            .checked_add(1)
+            .ok_or_else(|| "frame timestamp count overflowed".to_owned())?;
+        if frame_count > OUTPUT_FRAME_COUNT_MAX as usize {
+            let _ = terminate_child(&mut child);
+            return Err("frame timestamp count exceeded the safety limit".to_owned());
+        }
+        if let Some(previous_timestamp) = previous_timestamp {
+            let interval = timestamp - previous_timestamp;
+            if interval <= 0.0 {
+                let _ = terminate_child(&mut child);
+                return Err("video timestamps are not strictly increasing".to_owned());
+            }
+            if let Some(first_interval) = first_interval {
+                if (interval - first_interval).abs() > FRAME_INTERVAL_TOLERANCE_SECONDS {
+                    let _ = terminate_child(&mut child);
+                    return Err(
+                        "variable-frame-rate input is not supported; use a constant-frame-rate source"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                first_interval = Some(interval);
+            }
+        }
+        previous_timestamp = Some(timestamp);
+    }
+    drop(reader);
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for frame timestamp probe: {error}"))?;
+    if !status.success() {
+        return Err("frame timestamp probe failed".to_owned());
+    }
+    if frame_count == 0 {
+        return Err("frame timestamps were unavailable".to_owned());
+    }
+    assert!(
+        frame_count <= OUTPUT_FRAME_COUNT_MAX as usize,
+        "frame timestamp count must remain bounded"
+    );
+    assert!(
+        FRAME_INTERVAL_TOLERANCE_SECONDS > 0.0,
+        "frame-rate tolerance must be positive"
+    );
+    Ok(())
+}
+
 fn parse_rational(text: &str) -> Result<(u64, u64), String> {
     assert!(!text.is_empty(), "rational text must not be empty");
     assert!(text.len() <= 64, "rational text must remain bounded");
@@ -1542,6 +1844,49 @@ fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
     assert!(left > 0, "greatest common divisor must be positive");
     assert_eq!(right, 0, "bounded Euclidean algorithm must complete");
     left
+}
+
+fn adapt_configuration_for_cuda_memory(
+    configuration: &JobConfiguration,
+    metadata: &VideoMetadata,
+    cuda_gpu_index: i32,
+) -> Result<(JobConfiguration, bool), String> {
+    assert!(
+        metadata.width > 0,
+        "CUDA memory policy width must be positive"
+    );
+    assert!(
+        metadata.height > 0,
+        "CUDA memory policy height must be positive"
+    );
+    assert!(
+        cuda_gpu_index >= 0,
+        "CUDA memory policy index must be non-negative"
+    );
+    let (free_bytes, total_bytes) = cuda_free_memory_bytes(cuda_gpu_index)?;
+    assert!(
+        free_bytes <= total_bytes,
+        "free VRAM must not exceed total VRAM"
+    );
+    if free_bytes < CUDA_HALF_SCALE_FREE_MEMORY_MIN_BYTES {
+        return Err(format!(
+            "not enough free VRAM for CUDA inference: {} MiB available, {} MiB required",
+            free_bytes / 1024 / 1024,
+            CUDA_HALF_SCALE_FREE_MEMORY_MIN_BYTES / 1024 / 1024
+        ));
+    }
+    let is_uhd_source = metadata.width >= UHD_WIDTH_MIN || metadata.height >= UHD_HEIGHT_MIN;
+    if !is_uhd_source || configuration.use_uhd_mode {
+        return Ok((configuration.clone(), false));
+    }
+    if free_bytes >= CUDA_FULL_SCALE_FREE_MEMORY_MIN_BYTES {
+        return Ok((configuration.clone(), false));
+    }
+    let mut adjusted_configuration = configuration.clone();
+    adjusted_configuration.use_uhd_mode = true;
+    assert!(adjusted_configuration.use_uhd_mode);
+    assert!(free_bytes < CUDA_FULL_SCALE_FREE_MEMORY_MIN_BYTES);
+    Ok((adjusted_configuration, true))
 }
 
 fn adapt_configuration_for_memory(
@@ -1678,6 +2023,19 @@ fn checked_frame_size(width: u32, height: u32) -> Result<usize, String> {
     Ok(frame_size)
 }
 
+fn partial_output_is_playable(path: &Path) -> bool {
+    assert!(
+        !path.as_os_str().is_empty(),
+        "partial output path must not be empty"
+    );
+    let playable = path.is_file() && probe_video(path).is_ok();
+    assert!(
+        !path.as_os_str().is_empty(),
+        "partial output path must remain valid"
+    );
+    playable
+}
+
 fn partial_output_path(output_path: &Path) -> Result<PathBuf, String> {
     assert!(
         !output_path.as_os_str().is_empty(),
@@ -1720,6 +2078,68 @@ fn send_update(updates: &SyncSender<JobUpdate>, update: JobUpdate) {
         FRAME_SIZE_BYTES_MAX > 0,
         "frame size limit must remain valid"
     );
+}
+
+fn wait_media_child_with_timeout(
+    media_child: &mut MediaChild,
+    description: &str,
+) -> Result<(ExitStatus, bool), String> {
+    assert!(
+        !description.is_empty(),
+        "media child description must not be empty"
+    );
+    assert!(
+        MEDIA_GRACEFUL_WAIT_POLL_COUNT_MAX > 0,
+        "graceful media wait must have a finite limit"
+    );
+    assert!(
+        MEDIA_GRACEFUL_WAIT_POLL_INTERVAL > Duration::ZERO,
+        "graceful media wait interval must be positive"
+    );
+    let mut status = None;
+    let mut graceful = true;
+    for _ in 0..=MEDIA_GRACEFUL_WAIT_POLL_COUNT_MAX {
+        match media_child.child.try_wait() {
+            Ok(Some(child_status)) => {
+                status = Some(child_status);
+                break;
+            }
+            Ok(None) => thread::sleep(MEDIA_GRACEFUL_WAIT_POLL_INTERVAL),
+            Err(error) => {
+                graceful = false;
+                let cleanup_result = terminate_child(&mut media_child.child);
+                if let Err(cleanup_error) = cleanup_result {
+                    return Err(format!(
+                        "failed to inspect {description} ({error}) and terminate it: {cleanup_error}"
+                    ));
+                }
+                status = media_child.child.try_wait().map_err(|wait_error| {
+                    format!("failed to confirm {description} termination: {wait_error}")
+                })?;
+                break;
+            }
+        }
+    }
+    if status.is_none() {
+        graceful = false;
+        terminate_child(&mut media_child.child)?;
+        status = media_child
+            .child
+            .try_wait()
+            .map_err(|error| format!("failed to confirm {description} termination: {error}"))?;
+    }
+    let log_result = finish_log_worker(media_child);
+    log_result?;
+    let status = status.ok_or_else(|| format!("{description} status was unavailable"))?;
+    assert!(
+        media_child.log_worker.is_none(),
+        "timed media log must be released"
+    );
+    assert!(
+        MEDIA_GRACEFUL_WAIT_POLL_COUNT_MAX > 0,
+        "graceful media wait limit must remain configured"
+    );
+    Ok((status, graceful))
 }
 
 fn wait_media_child(media_child: &mut MediaChild, description: &str) -> Result<ExitStatus, String> {
@@ -1915,6 +2335,12 @@ mod tests {
         assert!(validate_target_fps(&configuration, &metadata).is_err());
         configuration.target_fps_num = 48;
         assert!(validate_target_fps(&configuration, &metadata).is_ok());
+        configuration.video_encoder = VideoEncoder::Automatic;
+        assert_eq!(
+            resolve_video_encoder(&configuration, None),
+            VideoEncoder::SoftwareH264,
+            "automatic NVENC must not use an unmapped Vulkan GPU index"
+        );
     }
 
     #[test]
@@ -1945,6 +2371,9 @@ mod tests {
             preserve_metadata: true,
         };
         assert!(validate_configuration(&configuration).is_ok());
+        configuration.output_path =
+            PathBuf::from(format!("/tmp/interpolate-config-output-{process_id}.mp4"));
+        assert!(validate_configuration(&configuration).is_err());
         configuration.output_path = input_path.clone();
         assert!(validate_configuration(&configuration).is_err());
         configuration.output_path = output_path.clone();
@@ -2012,12 +2441,15 @@ mod tests {
                 "srt",
                 "-pix_fmt",
                 "yuv420p",
+                "-r",
+                "4",
                 "-c:v",
                 "libx264",
                 "-threads",
                 "1",
             ])
             .arg(&input_path)
+            .args(["-r", "4"])
             .status()
             .expect("test FFmpeg generator should start");
         assert!(generated.success(), "test video generation must succeed");
@@ -2101,7 +2533,13 @@ mod tests {
                     active_phase_seen = true;
                     active_cancelled.store(true, Ordering::Release);
                 }
-                Ok(JobUpdate::Cancelled { .. }) => {
+                Ok(JobUpdate::Cancelled { partial_path }) => {
+                    assert!(
+                        partial_path
+                            .as_deref()
+                            .is_none_or(partial_output_is_playable),
+                        "reported partial output must be playable"
+                    );
                     active_cancellation_reported = true;
                     break;
                 }

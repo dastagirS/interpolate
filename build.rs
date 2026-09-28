@@ -104,7 +104,15 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=static=SPIRV");
     println!("cargo:rustc-link-lib=static=glslang");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=static=stdc++");
+        // Statically link the compiler runtimes so the release archive does not
+        // depend on the target distribution's libstdc++ or libgcc versions.
+        println!("cargo:rustc-link-arg=-static-libstdc++");
+        println!("cargo:rustc-link-arg=-static-libgcc");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     println!("cargo:rerun-if-changed=native/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/interpolate_backend.cpp");
     println!("cargo:rerun-if-changed=native/interpolate_backend.h");

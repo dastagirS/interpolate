@@ -4,5 +4,7 @@
 /scripts/verify-repository.sh @dastagirS
 /scripts/install-ci-dependencies.sh @dastagirS
 /scripts/configure-ci-vulkan.sh @dastagirS
+/scripts/build-cuda-runtime.sh @dastagirS
+/scripts/verify-portability.sh @dastagirS
 /models/rife-v4.25/ @dastagirS
 /legal/SOURCE-PROVENANCE.md @dastagirS

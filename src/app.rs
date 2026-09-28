@@ -3,7 +3,7 @@ use crate::backend::{
 };
 use crate::pipeline::{
     CadenceDiagnostics, ContentPreset, EncoderPreset, H264Profile, JobConfiguration, JobUpdate,
-    PerformanceDiagnostics, VideoEncoder, VideoMetadata, available_video_encoders,
+    PerformanceDiagnostics, VideoEncoder, VideoMetadata, available_nvdec, available_video_encoders,
     default_output_path, probe_video, run_job,
 };
 use crate::tray::{TrayCommand, TrayController};
@@ -300,6 +300,7 @@ struct InterpolateApp {
     selected_gpu_index: usize,
     video_encoders: Vec<VideoEncoder>,
     selected_video_encoder: usize,
+    nvdec_available: bool,
     use_nvdec: bool,
     cuda_inference_available: bool,
     cuda_inference_unavailable_reason: String,
@@ -380,6 +381,7 @@ impl InterpolateApp {
             Err(error) => (Vec::new(), Some(error)),
         };
         let video_encoders = available_video_encoders();
+        let nvdec_available = available_nvdec();
         let cuda_status = cuda_inference_status();
         let default_encoder_preset = if video_encoders.contains(&VideoEncoder::NvidiaH264) {
             EncoderPreset::NvidiaP5
@@ -395,6 +397,7 @@ impl InterpolateApp {
             selected_gpu_index: 0,
             video_encoders,
             selected_video_encoder: 0,
+            nvdec_available,
             use_nvdec: false,
             cuda_inference_available: cuda_status.available,
             cuda_inference_unavailable_reason: cuda_status.reason,
@@ -458,8 +461,8 @@ impl InterpolateApp {
             "encoder list must remain bounded"
         );
         assert!(
-            !app.use_nvdec || app.video_encoders.contains(&VideoEncoder::NvidiaH264),
-            "NVDEC requires an available NVIDIA encoder"
+            !app.use_nvdec || app.nvdec_available,
+            "NVDEC requires FFmpeg CUDA decode support"
         );
         assert!(
             !app.cuda_inference_enabled || app.cuda_inference_available,
@@ -1355,7 +1358,7 @@ impl InterpolateApp {
             self.video_encoders.len() <= 3,
             "encoder list must remain bounded"
         );
-        let nvdec_available = self.video_encoders.contains(&VideoEncoder::NvidiaH264);
+        let nvdec_available = self.nvdec_available;
         assert!(
             !self.use_nvdec || nvdec_available,
             "NVDEC cannot be enabled without NVIDIA support"
@@ -1365,8 +1368,8 @@ impl InterpolateApp {
             cx.notify();
         }
         assert!(
-            !self.use_nvdec || self.video_encoders.contains(&VideoEncoder::NvidiaH264),
-            "updated NVDEC selection requires NVIDIA support"
+            !self.use_nvdec || self.nvdec_available,
+            "updated NVDEC selection requires FFmpeg CUDA decode support"
         );
         assert!(
             !self.running || !self.use_nvdec || nvdec_available,
@@ -2236,7 +2239,7 @@ impl InterpolateApp {
         } else {
             self.cuda_inference_unavailable_reason.clone()
         };
-        let nvdec_available = self.video_encoders.contains(&VideoEncoder::NvidiaH264);
+        let nvdec_available = self.nvdec_available;
         div()
             .w_full()
             .relative()

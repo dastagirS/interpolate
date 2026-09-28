@@ -21,7 +21,9 @@ concurrency:
 jobs:
   linux-x86_64:
     name: Linux x86_64
-    runs-on: ubuntu-24.04
+    # Build on the oldest supported glibc baseline so the archive runs on
+    # newer distributions without inheriting the build host's libc version.
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     steps:
@@ -67,6 +69,11 @@ jobs:
             exit 1
           fi
 
+      - name: Install portable Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c # v5.0.0
+        with:
+          python-version: "3.12"
+
       - name: Install build dependencies
         run: scripts/install-ci-dependencies.sh
 
@@ -90,6 +97,7 @@ jobs:
         env:
           CI: "true"
           QUALITY_GATE_PROFILE: release
+          RUSTFLAGS: "-C target-cpu=x86-64"
         run: scripts/quality-gate.sh
 
       - name: Build release
@@ -97,6 +105,7 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           CARGO_INCREMENTAL: "0"
           CMAKE_BUILD_PARALLEL_LEVEL: "1"
+          RUSTFLAGS: "-C target-cpu=x86-64"
         run: |
           set -euo pipefail
           memory_available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
@@ -127,6 +136,8 @@ jobs:
             "$package_root/share/applications" \
             artifacts
           install -m 0755 target/release/interpolate "$package_root/interpolate"
+          install -m 0755 scripts/debug-cuda-runtime.sh \
+            "$package_root/debug-cuda-runtime.sh"
           install -m 0644 packaging/interpolate.desktop \
             "$package_root/share/applications/interpolate.desktop"
           install -m 0644 models/rife-v4.25/flownet.param \
@@ -156,6 +167,7 @@ jobs:
             echo 'Packaged executable has unresolved shared libraries.' >&2
             exit 1
           fi
+          scripts/verify-portability.sh "$package_root"
 
           tar --create --gzip --directory dist --file "artifacts/${archive_name}.tar.gz" "$archive_name"
           sha256sum "artifacts/${archive_name}.tar.gz" > "artifacts/${archive_name}.tar.gz.sha256"

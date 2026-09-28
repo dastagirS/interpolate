@@ -3,13 +3,25 @@ set -eu
 
 RUNTIME_ROOT=${INTERPOLATE_CUDA_RUNTIME_ROOT:-runtime/python}
 SYSTEM_PYTHON=${INTERPOLATE_SYSTEM_PYTHON:-python3}
-PYTORCH_REQUIREMENT=${INTERPOLATE_PYTORCH_REQUIREMENT:-'torch>=2.10,<2.15'}
+PYTORCH_REQUIREMENT=${INTERPOLATE_PYTORCH_REQUIREMENT:-'torch==2.14.0'}
 VSRIFE_REQUIREMENT=${INTERPOLATE_VSRIFE_REQUIREMENT:-'vsrife==5.7.0'}
-VAPOURSYNTH_REQUIREMENT=${INTERPOLATE_VAPOURSYNTH_REQUIREMENT:-vapoursynth}
+VAPOURSYNTH_REQUIREMENT=${INTERPOLATE_VAPOURSYNTH_REQUIREMENT:-'vapoursynth==80'}
+PYTHON_ISA_UNSUPPORTED_PATTERN='x86-64-v[234]'
+READ_ELF=$(command -v readelf || true)
 
 [ -n "$RUNTIME_ROOT" ]
 [ -n "$SYSTEM_PYTHON" ]
 [ -x "$(command -v "$SYSTEM_PYTHON")" ]
+[ -n "$READ_ELF" ]
+PYTHON_ISA_REQUIREMENTS=$(
+    "$READ_ELF" -n "$SYSTEM_PYTHON" 2>/dev/null |
+        awk '/x86 ISA needed:/ {print; exit}'
+)
+if printf '%s\n' "$PYTHON_ISA_REQUIREMENTS" | grep -Eq "$PYTHON_ISA_UNSUPPORTED_PATTERN"; then
+    echo "refusing to bundle $SYSTEM_PYTHON: it requires a newer x86-64 ISA" >&2
+    printf '%s\n' "$PYTHON_ISA_REQUIREMENTS" >&2
+    exit 1
+fi
 [ ! -e "$RUNTIME_ROOT" ] || rm -rf "$RUNTIME_ROOT"
 mkdir -p "$(dirname "$RUNTIME_ROOT")"
 "$SYSTEM_PYTHON" -m venv --copies "$RUNTIME_ROOT"
@@ -30,6 +42,15 @@ rm -f "$RUNTIME_ROOT/lib/python$PYTHON_VERSION/EXTERNALLY-MANAGED"
 test ! -e "$RUNTIME_ROOT/lib/python$PYTHON_VERSION/EXTERNALLY-MANAGED"
 cp -a "$PYTHON_LIBRARY/$PYTHON_LIBRARY_NAME" "$RUNTIME_ROOT/lib/$PYTHON_LIBRARY_NAME"
 mv "$RUNTIME_ROOT/bin/python3" "$RUNTIME_ROOT/bin/python3.real"
+RUNTIME_PYTHON_ISA_REQUIREMENTS=$(
+    "$READ_ELF" -n "$RUNTIME_ROOT/bin/python3.real" 2>/dev/null |
+        awk '/x86 ISA needed:/ {print; exit}'
+)
+if printf '%s\n' "$RUNTIME_PYTHON_ISA_REQUIREMENTS" | grep -Eq "$PYTHON_ISA_UNSUPPORTED_PATTERN"; then
+    echo "refusing to package the copied Python interpreter: it requires a newer x86-64 ISA" >&2
+    printf '%s\n' "$RUNTIME_PYTHON_ISA_REQUIREMENTS" >&2
+    exit 1
+fi
 cat > "$RUNTIME_ROOT/bin/python3" <<PYTHON_LAUNCHER
 #!/bin/sh
 set -eu

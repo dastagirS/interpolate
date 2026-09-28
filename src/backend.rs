@@ -2,8 +2,9 @@ use std::{
     ffi::{CStr, c_char, c_float, c_int, c_uchar, c_uint},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     ptr::NonNull,
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -16,6 +17,15 @@ const CPU_THREAD_COUNT_MAX: i32 = 16;
 const STATUS_OK: i32 = 0;
 const CUDA_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CUDA_FRAME_SIZE_MAX: usize = 128 * 1024 * 1024;
+const CUDA_WORKER_STDERR_MAX: usize = 16 * 1024;
+const CUDA_WORKER_STDERR_READ_BUFFER_SIZE: usize = 1024;
+const CUDA_WORKER_ERROR_MESSAGE_MAX: usize = 4096;
+const NVIDIA_SMI_QUERY_OUTPUT_MAX: usize = 4096;
+const CUDA_DEVICE_QUERY_OUTPUT_MAX: usize = 4096;
+const CUDA_MEMORY_QUERY_OUTPUT_MAX: usize = 128;
+const NVIDIA_SMI_GPU_QUERY: &str = "--query-gpu=name --format=csv,noheader,nounits";
+const CUDA_MEMORY_QUERY: &str = "import sys, torch; free, total = torch.cuda.mem_get_info(int(sys.argv[1])); print(f'{free}\\t{total}')";
+const CUDA_DEVICE_QUERY: &str = "import torch;\nassert torch.cuda.is_available();\nfor index in range(torch.cuda.device_count()):\n print(f'{index}\\t{torch.cuda.get_device_name(index)}')";
 const CUDA_WORKER_READY: &[u8; 4] = b"RIF1";
 const PYTORCH_MODEL_RELATIVE: &str = "models/rife-v4.25/flownet_v4.25.pkl";
 const PYTORCH_MODEL_ENVIRONMENT: &str = "INTERPOLATE_PYTORCH_MODEL";
@@ -76,6 +86,191 @@ pub fn cuda_inference_status() -> CudaInferenceStatus {
     assert!(!reason.is_empty(), "CUDA status reason must not be empty");
     assert!(reason.len() < 256, "CUDA status reason must remain bounded");
     CudaInferenceStatus { available, reason }
+}
+
+pub fn cuda_free_memory_bytes(cuda_gpu_index: i32) -> Result<(u64, u64), String> {
+    assert!(cuda_gpu_index >= 0, "CUDA GPU index must be non-negative");
+    assert!(
+        CUDA_MEMORY_QUERY_OUTPUT_MAX > 0,
+        "CUDA memory query output limit must be positive"
+    );
+    let python = python_executable()
+        .ok_or_else(|| "bundled Python runtime could not be located".to_owned())?;
+    let output = Command::new(python)
+        .args(["-c", CUDA_MEMORY_QUERY, &cuda_gpu_index.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to query CUDA memory: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "CUDA memory query failed with status {}",
+            output.status
+        ));
+    }
+    if output.stdout.len() > CUDA_MEMORY_QUERY_OUTPUT_MAX {
+        return Err("CUDA memory query returned too much output".to_owned());
+    }
+    let memory_text = String::from_utf8_lossy(&output.stdout);
+    let (free_text, total_text) = memory_text
+        .trim()
+        .split_once('\t')
+        .ok_or_else(|| "CUDA memory query returned an invalid result".to_owned())?;
+    let free_bytes = free_text
+        .parse::<u64>()
+        .map_err(|_| "CUDA free memory value is invalid".to_owned())?;
+    let total_bytes = total_text
+        .parse::<u64>()
+        .map_err(|_| "CUDA total memory value is invalid".to_owned())?;
+    if free_bytes == 0 || total_bytes == 0 || free_bytes > total_bytes {
+        return Err("CUDA memory query returned impossible values".to_owned());
+    }
+    assert!(
+        free_bytes <= total_bytes,
+        "free CUDA memory must not exceed total"
+    );
+    assert!(total_bytes > 0, "total CUDA memory must be positive");
+    Ok((free_bytes, total_bytes))
+}
+
+pub fn cuda_inference_device_index_for_gpu(vulkan_gpu_index: i32) -> Result<i32, String> {
+    assert!(
+        vulkan_gpu_index >= 0,
+        "Vulkan GPU index must be non-negative"
+    );
+    assert!(
+        CUDA_DEVICE_QUERY_OUTPUT_MAX > 0,
+        "CUDA device query output limit must be positive"
+    );
+    let vulkan_gpu_names = gpu_names()?;
+    let vulkan_gpu_index = usize::try_from(vulkan_gpu_index)
+        .map_err(|_| "Vulkan GPU index does not fit the host index type".to_owned())?;
+    let selected_gpu_name = vulkan_gpu_names
+        .get(vulkan_gpu_index)
+        .ok_or_else(|| "selected Vulkan GPU does not exist".to_owned())?;
+    let matching_vulkan_index = vulkan_gpu_names[..=vulkan_gpu_index]
+        .iter()
+        .filter(|name| *name == selected_gpu_name)
+        .count()
+        .checked_sub(1)
+        .ok_or_else(|| "selected Vulkan GPU occurrence could not be determined".to_owned())?;
+    let python = python_executable()
+        .ok_or_else(|| "bundled Python runtime could not be located".to_owned())?;
+    let output = Command::new(python)
+        .args(["-c", CUDA_DEVICE_QUERY])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to query CUDA devices: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "CUDA device query failed with status {}",
+            output.status
+        ));
+    }
+    if output.stdout.len() > CUDA_DEVICE_QUERY_OUTPUT_MAX {
+        return Err("CUDA device query returned too much output".to_owned());
+    }
+    let cuda_gpu_names = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, name)| name.to_owned()))
+        .collect::<Vec<_>>();
+    let cuda_gpu_index = cuda_gpu_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| *name == selected_gpu_name)
+        .nth(matching_vulkan_index)
+        .map(|(index, _)| index)
+        .ok_or_else(|| format!("selected GPU {selected_gpu_name} is not available through CUDA"))?;
+    let cuda_gpu_index = i32::try_from(cuda_gpu_index)
+        .map_err(|_| "CUDA GPU index does not fit the inference backend".to_owned())?;
+    assert!(
+        cuda_gpu_index >= 0,
+        "inference CUDA index must be non-negative"
+    );
+    assert!(
+        cuda_gpu_index < 256,
+        "inference CUDA index must remain bounded"
+    );
+    Ok(cuda_gpu_index)
+}
+
+pub fn cuda_device_index_for_gpu(vulkan_gpu_index: i32) -> Result<i32, String> {
+    assert!(
+        vulkan_gpu_index >= 0,
+        "Vulkan GPU index must be non-negative"
+    );
+    assert!(
+        NVIDIA_SMI_QUERY_OUTPUT_MAX > 0,
+        "NVIDIA device query output limit must be positive"
+    );
+    let vulkan_gpu_names = gpu_names()?;
+    let vulkan_gpu_index = usize::try_from(vulkan_gpu_index)
+        .map_err(|_| "Vulkan GPU index does not fit the host index type".to_owned())?;
+    let selected_gpu_name = vulkan_gpu_names
+        .get(vulkan_gpu_index)
+        .ok_or_else(|| "selected Vulkan GPU does not exist".to_owned())?;
+    let matching_vulkan_index = vulkan_gpu_names[..=vulkan_gpu_index]
+        .iter()
+        .filter(|name| *name == selected_gpu_name)
+        .count()
+        .checked_sub(1)
+        .ok_or_else(|| "selected Vulkan GPU occurrence could not be determined".to_owned())?;
+    let cuda_gpu_names = nvidia_smi_gpu_names()?;
+    let cuda_gpu_index = cuda_gpu_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| *name == selected_gpu_name)
+        .nth(matching_vulkan_index)
+        .map(|(index, _)| index)
+        .ok_or_else(|| {
+            format!("selected GPU {selected_gpu_name} is not available through the NVIDIA driver")
+        })?;
+    let cuda_gpu_index = i32::try_from(cuda_gpu_index)
+        .map_err(|_| "CUDA GPU index does not fit the media backend".to_owned())?;
+    assert!(
+        cuda_gpu_index >= 0,
+        "mapped CUDA GPU index must be non-negative"
+    );
+    assert!(
+        cuda_gpu_index < 256,
+        "mapped CUDA GPU index must remain bounded"
+    );
+    Ok(cuda_gpu_index)
+}
+
+fn nvidia_smi_gpu_names() -> Result<Vec<String>, String> {
+    assert!(
+        NVIDIA_SMI_QUERY_OUTPUT_MAX > 0,
+        "NVIDIA query output limit must be positive"
+    );
+    let output = Command::new("nvidia-smi")
+        .args(NVIDIA_SMI_GPU_QUERY.split_whitespace())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to query NVIDIA devices: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "NVIDIA device query failed with status {}",
+            output.status
+        ));
+    }
+    if output.stdout.len() > NVIDIA_SMI_QUERY_OUTPUT_MAX {
+        return Err("NVIDIA device query returned too much output".to_owned());
+    }
+    let names = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err("NVIDIA device query returned no GPUs".to_owned());
+    }
+    assert!(!names.is_empty(), "NVIDIA device list must not be empty");
+    assert!(names.len() <= 256, "NVIDIA device list must remain bounded");
+    Ok(names)
 }
 
 fn resolve_pytorch_model_path() -> Option<PathBuf> {
@@ -300,6 +495,7 @@ pub struct CudaBackend {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    stderr_reader: Option<JoinHandle<String>>,
     frame_size: usize,
 }
 
@@ -357,6 +553,11 @@ impl CudaBackend {
             let _ = terminate_process(&mut child);
             return Err("PyTorch RIFE worker stdout is unavailable".to_owned());
         };
+        let Some(error_output) = child.stderr.take() else {
+            let _ = terminate_process(&mut child);
+            return Err("PyTorch RIFE worker stderr is unavailable".to_owned());
+        };
+        let stderr_reader = std::thread::spawn(move || read_worker_stderr(error_output));
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut output = BufReader::new(output);
@@ -369,20 +570,27 @@ impl CudaBackend {
         let ready_result = match ready_receiver.recv_timeout(CUDA_WORKER_STARTUP_TIMEOUT) {
             Ok(result) => result,
             Err(_) => {
-                let _ = terminate_process(&mut child);
-                return Err("PyTorch RIFE worker startup timed out".to_owned());
+                return Err(worker_startup_failure(
+                    &mut child,
+                    stderr_reader,
+                    "PyTorch RIFE worker startup timed out",
+                ));
             }
         };
         let output = match ready_result {
             Ok((true, output)) => output,
             Ok((false, _)) => {
-                let _ = terminate_process(&mut child);
-                return Err("PyTorch RIFE worker returned an invalid handshake".to_owned());
+                return Err(worker_startup_failure(
+                    &mut child,
+                    stderr_reader,
+                    "PyTorch RIFE worker returned an invalid handshake",
+                ));
             }
             Err(error) => {
-                let _ = terminate_process(&mut child);
-                return Err(format!(
-                    "PyTorch RIFE worker failed during startup: {error}"
+                return Err(worker_startup_failure(
+                    &mut child,
+                    stderr_reader,
+                    &format!("PyTorch RIFE worker failed during startup: {error}"),
                 ));
             }
         };
@@ -391,6 +599,7 @@ impl CudaBackend {
             child,
             input,
             output,
+            stderr_reader: Some(stderr_reader),
             frame_size,
         })
     }
@@ -439,11 +648,77 @@ impl Drop for CudaBackend {
     fn drop(&mut self) {
         assert!(self.frame_size > 0, "CUDA frame size must remain positive");
         let _ = terminate_process(&mut self.child);
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
+        }
         assert!(
             self.frame_size <= CUDA_FRAME_SIZE_MAX,
             "CUDA frame must remain bounded"
         );
     }
+}
+
+fn read_worker_stderr(mut error_output: ChildStderr) -> String {
+    assert!(
+        CUDA_WORKER_STDERR_MAX > 0,
+        "worker stderr limit must be positive"
+    );
+    assert!(
+        CUDA_WORKER_STDERR_READ_BUFFER_SIZE > 0,
+        "worker stderr read buffer must be positive"
+    );
+    let mut captured = Vec::with_capacity(CUDA_WORKER_STDERR_MAX);
+    let mut buffer = [0_u8; CUDA_WORKER_STDERR_READ_BUFFER_SIZE];
+    let mut truncated = false;
+    loop {
+        let bytes_read = match error_output.read(&mut buffer) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                return format!("worker stderr read failed: {error}");
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        let bytes_to_capture = bytes_read.min(CUDA_WORKER_STDERR_MAX - captured.len());
+        captured.extend_from_slice(&buffer[..bytes_to_capture]);
+        truncated |= bytes_to_capture < bytes_read;
+    }
+    let mut message = String::from_utf8_lossy(&captured).trim().to_owned();
+    if truncated {
+        message.push_str("\n[worker stderr truncated]");
+    }
+    message
+}
+
+fn worker_startup_failure(
+    child: &mut Child,
+    stderr_reader: JoinHandle<String>,
+    reason: &str,
+) -> String {
+    assert!(
+        !reason.is_empty(),
+        "worker startup reason must not be empty"
+    );
+    assert!(
+        reason.len() <= CUDA_WORKER_ERROR_MESSAGE_MAX,
+        "worker startup reason must remain bounded"
+    );
+    let termination_result = terminate_process(child);
+    let stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| "worker stderr reader panicked".to_owned());
+    let mut message = reason.to_owned();
+    if !stderr.is_empty() {
+        message.push_str("; stderr: ");
+        message.push_str(&stderr);
+    }
+    if let Err(error) = termination_result {
+        message.push_str("; cleanup: ");
+        message.push_str(&error);
+    }
+    message.truncate(CUDA_WORKER_ERROR_MESSAGE_MAX);
+    message
 }
 
 fn terminate_process(child: &mut Child) -> Result<(), String> {

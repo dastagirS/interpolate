@@ -26,6 +26,30 @@ set(NCNN_PIXEL_ROTATE OFF CACHE BOOL "" FORCE)
 set(NCNN_PIXEL_AFFINE OFF CACHE BOOL "" FORCE)
 set(NCNN_PIXEL_DRAWING OFF CACHE BOOL "" FORCE)
 set(NCNN_INT8 OFF CACHE BOOL "" FORCE)
+
+# Release archives must run on older x86-64 CPUs than the build host. ncnn's
+# runtime-dispatch variants are useful for local benchmarks, but shipping those
+# variants has already allowed a startup SIGILL on a different machine. Keep
+# the packaged backend at the x86-64 baseline; Vulkan remains the performance
+# path, so this avoids a compatibility failure without changing GPU inference.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64 -mtune=generic")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64 -mtune=generic")
+    set(NCNN_AVX OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVX2 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVX512 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVX512BF16 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVX512FP16 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVX512VNNI OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVXVNNI OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVXVNNIINT8 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVXVNNIINT16 OFF CACHE BOOL "" FORCE)
+    set(NCNN_AVXNECONVERT OFF CACHE BOOL "" FORCE)
+    set(NCNN_F16C OFF CACHE BOOL "" FORCE)
+    set(NCNN_FMA OFF CACHE BOOL "" FORCE)
+    set(NCNN_XOP OFF CACHE BOOL "" FORCE)
+endif()
+
 set(NCNN_DISABLE_RTTI ON CACHE BOOL "" FORCE)
 set(NCNN_DISABLE_EXCEPTION ON CACHE BOOL "" FORCE)
 
